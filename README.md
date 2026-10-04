@@ -1,16 +1,34 @@
 # notpush-delivery v2
 
-API central de Push do 10App Delivery.
+API separada para notificações YAPOOD.
 
-## Eventos
-- `novo`: cliente autenticado cria o pedido -> notifica o ADM da loja.
-- `aceptado`: ADM da loja aceita -> notifica o cliente.
-- `despachado`: ADM da loja despacha -> notifica o cliente.
+## Render
 
-## Rotas
-- `GET /health`
-- `POST /registrar-token` (Firebase ID token)
-- `POST /remover-token` (Firebase ID token)
-- `POST /notificar-pedido` (Firebase ID token)
+Build/Start:
+npm install
+npm start
 
-A API nunca confia no destinatário enviado pelo navegador: lê o pedido no Firebase e determina o cliente ou `ownerUid` da loja.
+Variáveis:
+- FIREBASE_DATABASE_URL
+- FIREBASE_SERVICE_ACCOUNT_JSON
+- APP_URL
+
+Rotas:
+GET /
+GET /health
+POST /registrar-token
+POST /remover-token
+POST /notificar-pedido
+
+O endpoint /notificar-pedido recebe:
+{
+  "pedidoKey": "...",
+  "evento": "aceptado"
+}
+
+ou:
+
+{
+  "pedidoKey": "...",
+  "evento": "despachado"
+}

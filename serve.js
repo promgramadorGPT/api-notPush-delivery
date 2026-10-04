@@ -1,158 +1,318 @@
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const crypto = require('crypto');
-const admin = require('firebase-admin');
-require('dotenv').config();
+const express = require("express");
+const cors = require("cors");
+const helmet = require("helmet");
+const admin = require("firebase-admin");
+const crypto = require("crypto");
 
 const app = express();
-app.use(helmet());
-app.use(cors({ origin: true }));
-app.use(express.json({ limit: '256kb' }));
 
-function initFirebase() {
-  if (admin.apps.length) return;
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (!raw) throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON não configurado.');
-  const serviceAccount = typeof raw === 'string' ? JSON.parse(raw) : raw;
+app.use(cors({
+  origin: true,
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+app.use(helmet());
+app.use(express.json());
+
+function log(...args) {
+  console.log("[NotPush]", ...args);
+}
+
+// ===============================
+// Firebase Admin
+// ===============================
+let firebaseReady = false;
+
+try {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
-    databaseURL: process.env.FIREBASE_DATABASE_URL || 'https://app-delivery-frontend-da5d0-default-rtdb.firebaseio.com'
+    databaseURL: process.env.FIREBASE_DATABASE_URL
   });
-}
-initFirebase();
-const db = admin.database();
 
-function hashToken(token) {
-  return crypto.createHash('sha256').update(String(token)).digest('hex');
+  firebaseReady = true;
+  log("Firebase Admin conectado.");
+} catch (err) {
+  console.error("[NotPush] Erro ao inicializar Firebase:", err.message);
 }
 
-async function authUser(req, res, next) {
+const db = () => admin.database();
+
+async function autenticar(req, res, next) {
   try {
-    const header = req.headers.authorization || '';
-    if (!header.startsWith('Bearer ')) return res.status(401).json({ ok:false, error:'Token Firebase ausente.' });
-    req.user = await admin.auth().verifyIdToken(header.slice(7));
+    const header = req.headers.authorization || "";
+
+    if (!header.startsWith("Bearer ")) {
+      return res.status(401).json({
+        ok: false,
+        error: "Token Firebase ausente."
+      });
+    }
+
+    const idToken = header.slice(7);
+    const decoded = await admin.auth().verifyIdToken(idToken);
+
+    req.user = decoded;
     next();
   } catch (err) {
-    console.error('[auth]', err.message);
-    res.status(401).json({ ok:false, error:'Token Firebase inválido ou expirado.' });
+    console.error("[NotPush] Falha auth:", err.message);
+    return res.status(401).json({
+      ok: false,
+      error: "Token Firebase inválido."
+    });
   }
 }
 
-function dadosEvento(evento) {
-  const mapa = {
-    novo: { title:'Nuevo pedido 🔔', body:'Tienes un nuevo pedido pendiente.' },
-    aceptado: { title:'¡Pedido aceptado! 🎉', body:'La tienda aceptó tu pedido y ya lo está preparando.' },
-    despachado: { title:'¡Pedido en camino! 🛵', body:'Tu pedido salió para entrega.' }
-  };
-  return mapa[evento] || null;
+function hashToken(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
 }
 
-async function tokensDoUsuario(uid) {
-  const snap = await db.ref(`fcm_tokens/${uid}`).once('value');
-  const dados = snap.val() || {};
-  return Object.entries(dados).map(([key, value]) => ({ key, ...(value || {}) })).filter(x => x.token);
+function eventoValido(evento) {
+  return evento === "aceptado" || evento === "despachado";
 }
 
-async function enviarParaUsuario(uid, evento, link) {
-  const registros = await tokensDoUsuario(uid);
-  if (!registros.length) return { enviados:0, tokens:0, semToken:true };
-  const info = dadosEvento(evento);
-  const tokens = registros.map(x => x.token);
-  const response = await admin.messaging().sendEachForMulticast({
-    tokens,
-    notification: { title: info.title, body: info.body },
-    data: { evento, link: String(link || process.env.APP_URL || '/') },
-    webpush: { fcmOptions: { link: String(link || process.env.APP_URL || '/') } }
+// ===============================
+// Health
+// ===============================
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "notpush-delivery"
   });
+});
 
-  const invalidos = [];
-  response.responses.forEach((r, i) => {
-    const code = r.error?.code || '';
-    if (!r.success && (code.includes('registration-token-not-registered') || code.includes('invalid-registration-token'))) {
-      invalidos.push(registros[i].key);
-    }
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "notpush-delivery",
+    firebase: firebaseReady,
+    time: new Date().toISOString()
   });
-  await Promise.all(invalidos.map(key => db.ref(`fcm_tokens/${uid}/${key}`).remove().catch(()=>{})));
-  return { enviados: response.successCount, falhas: response.failureCount, tokens: tokens.length, removidos: invalidos.length };
-}
-
-async function pedido(pedidoKey) {
-  if (!pedidoKey) return null;
-  const snap = await db.ref(`pedidos/${pedidoKey}`).once('value');
-  return snap.exists() ? { key: pedidoKey, ...(snap.val() || {}) } : null;
-}
-
-async function loja(lojaId) {
-  if (!lojaId) return null;
-  const snap = await db.ref(`restaurantes/${lojaId}`).once('value');
-  return snap.exists() ? snap.val() : null;
-}
-
-app.get('/health', (_req, res) => res.json({ ok:true, service:'notpush-delivery', firebase:admin.apps.length>0, time:new Date().toISOString() }));
-
-app.post('/registrar-token', authUser, async (req, res) => {
-  try {
-    const token = String(req.body?.token || '').trim();
-    if (!token || token.length < 20) return res.status(400).json({ ok:false, error:'Token FCM inválido.' });
-    const key = hashToken(token);
-    await db.ref(`fcm_tokens/${req.user.uid}/${key}`).update({ token, plataforma:String(req.body?.plataforma || 'web'), atualizadoEm:new Date().toISOString() });
-    res.json({ ok:true, uid:req.user.uid, key });
-  } catch (err) {
-    console.error('[registrar-token]', err);
-    res.status(500).json({ ok:false, error:'Não foi possível registrar o token.' });
-  }
 });
 
-app.post('/remover-token', authUser, async (req, res) => {
+// ===============================
+// Registrar token FCM
+// ===============================
+app.post("/registrar-token", autenticar, async (req, res) => {
   try {
-    const token = String(req.body?.token || '').trim();
-    if (!token) return res.status(400).json({ ok:false, error:'Token FCM ausente.' });
-    await db.ref(`fcm_tokens/${req.user.uid}/${hashToken(token)}`).remove();
-    res.json({ ok:true });
-  } catch (err) {
-    console.error('[remover-token]', err);
-    res.status(500).json({ ok:false, error:'Não foi possível remover o token.' });
-  }
-});
+    const { token, plataforma = "web" } = req.body;
 
-app.post('/notificar-pedido', authUser, async (req, res) => {
-  try {
-    const pedidoKey = String(req.body?.pedidoKey || '').trim();
-    const evento = String(req.body?.evento || '').trim();
-    if (!pedidoKey || !dadosEvento(evento)) return res.status(400).json({ ok:false, error:'pedidoKey ou evento inválido.' });
-
-    const p = await pedido(pedidoKey);
-    if (!p) return res.status(404).json({ ok:false, error:'Pedido não encontrado.' });
-
-    const lojaDados = await loja(p.lojaId);
-    if (!lojaDados) return res.status(404).json({ ok:false, error:'Loja não encontrada.' });
-
-    let destinoUid;
-    if (evento === 'novo') {
-      if (p.clienteUid !== req.user.uid) return res.status(403).json({ ok:false, error:'Você não é o cliente deste pedido.' });
-      destinoUid = lojaDados.ownerUid;
-    } else {
-      if (lojaDados.ownerUid !== req.user.uid) return res.status(403).json({ ok:false, error:'Você não administra esta loja.' });
-      destinoUid = p.clienteUid;
+    if (!token) {
+      return res.status(400).json({
+        ok: false,
+        error: "Token FCM ausente."
+      });
     }
-    if (!destinoUid) return res.status(400).json({ ok:false, error:'Usuário destinatário não encontrado.' });
 
-    const marker = db.ref(`notificaciones_pedidos/${pedidoKey}/${evento}`);
-    const markerSnap = await marker.once('value');
-    if (markerSnap.exists()) return res.json({ ok:true, duplicado:true, destinoUid });
+    const uid = req.user.uid;
+    const tokenId = hashToken(token);
 
-    const link = process.env.APP_URL || '/';
-    const resultado = await enviarParaUsuario(destinoUid, evento, link);
-    await marker.set({ criadoEm:new Date().toISOString(), porUid:req.user.uid, destinoUid, resultado });
-    res.json({ ok:true, evento, pedidoKey, destinoUid, ...resultado });
+    await db().ref(`fcm_tokens/${uid}/${tokenId}`).set({
+      token,
+      plataforma,
+      uid,
+      atualizadoEm: new Date().toISOString()
+    });
+
+    log("Token registrado:", uid, tokenId);
+
+    return res.json({
+      ok: true,
+      uid,
+      tokenId
+    });
   } catch (err) {
-    console.error('[notificar-pedido]', err);
-    res.status(500).json({ ok:false, error:'Erro ao enviar notificação.' });
+    console.error("[NotPush] Erro /registrar-token:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message
+    });
   }
 });
 
-app.use((_req, res) => res.status(404).json({ ok:false, error:'Rota não encontrada.' }));
+// ===============================
+// Remover token FCM
+// ===============================
+app.post("/remover-token", autenticar, async (req, res) => {
+  try {
+    const { token } = req.body;
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 notpush-delivery ouvindo na porta ${PORT}`));
+    if (!token) {
+      return res.status(400).json({
+        ok: false,
+        error: "Token FCM ausente."
+      });
+    }
+
+    const uid = req.user.uid;
+    const tokenId = hashToken(token);
+
+    await db().ref(`fcm_tokens/${uid}/${tokenId}`).remove();
+
+    log("Token removido:", uid, tokenId);
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("[NotPush] Erro /remover-token:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message
+    });
+  }
+});
+
+// ===============================
+// Notificar cliente sobre pedido
+// ===============================
+app.post("/notificar-pedido", autenticar, async (req, res) => {
+  try {
+    const { pedidoKey, evento } = req.body;
+
+    log("Pedido recebido:", pedidoKey, "evento:", evento, "por:", req.user.uid);
+
+    if (!pedidoKey) {
+      return res.status(400).json({
+        ok: false,
+        error: "pedidoKey ausente."
+      });
+    }
+
+    if (!eventoValido(evento)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Evento inválido. Use aceptado ou despachado."
+      });
+    }
+
+    const pedidoSnap = await db().ref(`pedidos/${pedidoKey}`).once("value");
+    const pedido = pedidoSnap.val();
+
+    if (!pedido) {
+      return res.status(404).json({
+        ok: false,
+        error: "Pedido não encontrado."
+      });
+    }
+
+    const lojaSnap = await db().ref(`restaurantes/${pedido.lojaId}`).once("value");
+    const loja = lojaSnap.val();
+
+    if (!loja || loja.ownerUid !== req.user.uid) {
+      return res.status(403).json({
+        ok: false,
+        error: "Usuário não é proprietário da loja deste pedido."
+      });
+    }
+
+    const destinoUid = pedido.clienteUid;
+
+    if (!destinoUid) {
+      return res.status(400).json({
+        ok: false,
+        error: "Pedido sem clienteUid."
+      });
+    }
+
+    const tokensSnap = await db().ref(`fcm_tokens/${destinoUid}`).once("value");
+    const tokensObj = tokensSnap.val() || {};
+
+    const tokens = Object.values(tokensObj)
+      .map(item => item?.token)
+      .filter(Boolean);
+
+    log("Tokens encontrados:", tokens.length, "para:", destinoUid);
+
+    const titulo =
+      evento === "aceptado"
+        ? "Pedido aceptado"
+        : "Pedido despachado";
+
+    const corpo =
+      evento === "aceptado"
+        ? "Tu pedido fue aceptado por la tienda."
+        : "Tu pedido ya está en camino.";
+
+    let enviados = 0;
+    let falhas = 0;
+    const invalidos = [];
+
+    if (tokens.length > 0) {
+      const response = await admin.messaging().sendEachForMulticast({
+        tokens,
+        notification: {
+          title: titulo,
+          body: corpo
+        },
+        data: {
+          pedidoKey: String(pedidoKey),
+          evento: String(evento),
+          url: process.env.APP_URL || "/"
+        },
+        webpush: {
+          fcmOptions: {
+            link: process.env.APP_URL || "/"
+          }
+        }
+      });
+
+      enviados = response.successCount;
+      falhas = response.failureCount;
+
+      response.responses.forEach((item, index) => {
+        if (!item.success) {
+          const code = item.error?.code || "";
+          if (
+            code.includes("registration-token-not-registered") ||
+            code.includes("invalid-registration-token")
+          ) {
+            invalidos.push(tokens[index]);
+          }
+          console.error(
+            "[NotPush] Falha FCM:",
+            code,
+            item.error?.message || ""
+          );
+        }
+      });
+
+      for (const token of invalidos) {
+        await db().ref(`fcm_tokens/${destinoUid}/${hashToken(token)}`).remove();
+      }
+    }
+
+    const registro = {
+      criadoEm: new Date().toISOString(),
+      destinoUid,
+      porUid: req.user.uid,
+      resultado: {
+        enviados,
+        falhas,
+        tokens: tokens.length,
+        semToken: tokens.length === 0
+      }
+    };
+
+    await db().ref(`notificaciones_pedidos/${pedidoKey}/${evento}`).set(registro);
+
+    return res.json({
+      ok: true,
+      pedidoKey,
+      evento,
+      destinoUid,
+      ...registro.resultado
+    });
+  } catch (err) {
+    console.error("[NotPush] Erro /notificar-pedido:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message
+    });
+  }
+});
+
+const PORT = process.env.PORT || 10000;
+
+app.listen(PORT, () => {
+  log(`notpush-delivery ouvindo na porta ${PORT}`);
+});
