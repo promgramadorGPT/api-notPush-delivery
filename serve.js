@@ -153,6 +153,152 @@ app.post("/remover-token", autenticar, async (req, res) => {
   }
 });
 
+
+app.post("/notificar-master", autenticar, async (req, res) => {
+  try {
+    const { titulo, corpo, link = "", campanhaId = "" } = req.body;
+
+    if (!titulo || !String(titulo).trim()) {
+      return res.status(400).json({ ok: false, error: "Título ausente." });
+    }
+    if (!corpo || !String(corpo).trim()) {
+      return res.status(400).json({ ok: false, error: "Mensagem ausente." });
+    }
+
+    const roleSnap = await db().ref(`admins/${req.user.uid}/role`).once("value");
+    if (roleSnap.val() !== "master") {
+      return res.status(403).json({ ok: false, error: "Usuário não é Master." });
+    }
+
+    const tokensSnap = await db().ref("fcm_tokens").once("value");
+    const usersTokens = tokensSnap.val() || {};
+    const tokens = [];
+
+    for (const [uid, entries] of Object.entries(usersTokens)) {
+      for (const [tokenId, item] of Object.entries(entries || {})) {
+        if (item?.token) tokens.push({ uid, tokenId, token: item.token });
+      }
+    }
+
+    log("Master: tokens encontrados:", tokens.length);
+
+    const baseLink = String(link || process.env.APP_URL || "/").trim();
+    const campanha = String(campanhaId || `master-${Date.now()}`);
+
+    if (!tokens.length) {
+      return res.json({
+        ok: true,
+        campanhaId: campanha,
+        enviados: 0,
+        falhas: 0,
+        tokens: 0,
+        semToken: true
+      });
+    }
+
+    const enviados = [];
+    const falhas = [];
+    const invalidos = [];
+
+    for (let inicio = 0; inicio < tokens.length; inicio += 500) {
+      const lote = tokens.slice(inicio, inicio + 500);
+
+      const messages = lote.map(item => ({
+        token: item.token,
+        notification: {
+          title: String(titulo).trim(),
+          body: String(corpo).trim()
+        },
+        data: {
+          tipo: "master",
+          campanhaId: campanha,
+          url: baseLink
+        },
+        webpush: {
+          fcmOptions: { link: baseLink }
+        }
+      }));
+
+      log(`Master: enviando lote ${Math.floor(inicio / 500) + 1} com ${messages.length} token(s)...`);
+
+      try {
+        const response = await comTimeout(
+          admin.messaging().sendEach(messages),
+          30000,
+          "Envio FCM Master"
+        );
+
+        response.responses.forEach((result, index) => {
+          const item = lote[index];
+
+          if (result.success) {
+            enviados.push(result.messageId);
+          } else {
+            const code = result.error?.code || "unknown";
+            const messageText = result.error?.message || String(result.error || "Falha FCM.");
+            falhas.push({
+              uid: item.uid,
+              tokenId: item.tokenId,
+              code,
+              message: messageText
+            });
+
+            if (
+              code.includes("registration-token-not-registered") ||
+              code.includes("invalid-registration-token")
+            ) {
+              invalidos.push(item);
+            }
+          }
+        });
+      } catch (err) {
+        console.error("[NotPush] Master FCM lote erro:", err.message);
+        for (const item of lote) {
+          falhas.push({
+            uid: item.uid,
+            tokenId: item.tokenId,
+            code: err?.code || "batch-error",
+            message: err?.message || String(err)
+          });
+        }
+      }
+    }
+
+    for (const item of invalidos) {
+      await db().ref(`fcm_tokens/${item.uid}/${item.tokenId}`).remove().catch(() => {});
+    }
+
+    const resultado = {
+      criadoEm: new Date().toISOString(),
+      porUid: req.user.uid,
+      titulo: String(titulo).trim(),
+      corpo: String(corpo).trim(),
+      link: baseLink,
+      resultado: {
+        enviados: enviados.length,
+        falhas: falhas.length,
+        tokens: tokens.length,
+        semToken: false,
+        messageIds: enviados.slice(0, 20),
+        erros: falhas.slice(0, 50)
+      }
+    };
+
+    await db().ref(`notificaciones_master/${campanha}`).set(resultado);
+
+    log("MASTER RESULTADO FINAL:", JSON.stringify(resultado.resultado));
+
+    return res.json({
+      ok: falhas.length === 0,
+      campanhaId: campanha,
+      ...resultado.resultado
+    });
+  } catch (err) {
+    console.error("[NotPush] ERRO /notificar-master:", err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.post("/notificar-pedido", autenticar, async (req, res) => {
   try {
     const { pedidoKey, evento } = req.body;
