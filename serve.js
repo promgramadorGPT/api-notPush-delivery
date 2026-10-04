@@ -67,7 +67,7 @@ function hashToken(token) {
 }
 
 function eventoValido(evento) {
-  return evento === "aceptado" || evento === "despachado";
+  return evento === "novo" || evento === "aceptado" || evento === "despachado";
 }
 
 function comTimeout(promise, ms, label) {
@@ -172,7 +172,7 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
     if (!eventoValido(evento)) {
       return res.status(400).json({
         ok: false,
-        error: "Evento inválido. Use aceptado ou despachado."
+        error: "Evento inválido. Use novo, aceptado ou despachado."
       });
     }
 
@@ -192,19 +192,41 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
     const lojaSnap = await db().ref(`restaurantes/${pedido.lojaId}`).once("value");
     const loja = lojaSnap.val();
 
-    if (!loja || loja.ownerUid !== req.user.uid) {
-      return res.status(403).json({
+    if (!loja || !loja.ownerUid) {
+      return res.status(404).json({
         ok: false,
-        error: "Usuário não é proprietário da loja deste pedido."
+        error: "Loja do pedido não encontrada ou sem ownerUid."
       });
     }
 
-    const destinoUid = pedido.clienteUid;
+    let destinoUid;
+
+    if (evento === "novo") {
+      // O cliente criou o pedido: somente o próprio cliente pode disparar
+      // esta notificação, e o destino é o dono da loja.
+      if (pedido.clienteUid !== req.user.uid) {
+        return res.status(403).json({
+          ok: false,
+          error: "Usuário não é o cliente deste pedido."
+        });
+      }
+      destinoUid = loja.ownerUid;
+    } else {
+      // Aceitado/despachado: somente o dono da loja pode disparar,
+      // e o destino é o cliente do pedido.
+      if (loja.ownerUid !== req.user.uid) {
+        return res.status(403).json({
+          ok: false,
+          error: "Usuário não é proprietário da loja deste pedido."
+        });
+      }
+      destinoUid = pedido.clienteUid;
+    }
 
     if (!destinoUid) {
       return res.status(400).json({
         ok: false,
-        error: "Pedido sem clienteUid."
+        error: "Destino da notificação não encontrado."
       });
     }
 
@@ -245,13 +267,15 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
       });
     }
 
-    const titulo = evento === "aceptado"
-      ? "Pedido aceptado"
-      : "Pedido despachado";
+    const titulo = evento === "novo"
+      ? "Nuevo pedido"
+      : (evento === "aceptado" ? "Pedido aceptado" : "Pedido despachado");
 
-    const corpo = evento === "aceptado"
-      ? "Tu pedido fue aceptado por la tienda."
-      : "Tu pedido ya está en camino.";
+    const corpo = evento === "novo"
+      ? `Has recibido un nuevo pedido${pedido.numeroPedido ? ` #${pedido.numeroPedido}` : ""}.`
+      : (evento === "aceptado"
+        ? "Tu pedido fue aceptado por la tienda."
+        : "Tu pedido ya está en camino.");
 
     const enviados = [];
     const falhas = [];
