@@ -18,13 +18,13 @@ function log(...args) {
   console.log("[NotPush]", ...args);
 }
 
-// ===============================
-// Firebase Admin
-// ===============================
 let firebaseReady = false;
 
 try {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (!raw) throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON não configurado.");
+
+  const serviceAccount = JSON.parse(raw);
 
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
@@ -51,9 +51,7 @@ async function autenticar(req, res, next) {
     }
 
     const idToken = header.slice(7);
-    const decoded = await admin.auth().verifyIdToken(idToken);
-
-    req.user = decoded;
+    req.user = await admin.auth().verifyIdToken(idToken);
     next();
   } catch (err) {
     console.error("[NotPush] Falha auth:", err.message);
@@ -72,14 +70,17 @@ function eventoValido(evento) {
   return evento === "aceptado" || evento === "despachado";
 }
 
-// ===============================
-// Health
-// ===============================
+function comTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} excedeu ${ms}ms.`)), ms)
+    )
+  ]);
+}
+
 app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "notpush-delivery"
-  });
+  res.json({ ok: true, service: "notpush-delivery" });
 });
 
 app.get("/health", (req, res) => {
@@ -91,9 +92,6 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ===============================
-// Registrar token FCM
-// ===============================
 app.post("/registrar-token", autenticar, async (req, res) => {
   try {
     const { token, plataforma = "web" } = req.body;
@@ -117,11 +115,7 @@ app.post("/registrar-token", autenticar, async (req, res) => {
 
     log("Token registrado:", uid, tokenId);
 
-    return res.json({
-      ok: true,
-      uid,
-      tokenId
-    });
+    return res.json({ ok: true, uid, tokenId });
   } catch (err) {
     console.error("[NotPush] Erro /registrar-token:", err);
     return res.status(500).json({
@@ -131,9 +125,6 @@ app.post("/registrar-token", autenticar, async (req, res) => {
   }
 });
 
-// ===============================
-// Remover token FCM
-// ===============================
 app.post("/remover-token", autenticar, async (req, res) => {
   try {
     const { token } = req.body;
@@ -162,14 +153,14 @@ app.post("/remover-token", autenticar, async (req, res) => {
   }
 });
 
-// ===============================
-// Notificar cliente sobre pedido
-// ===============================
 app.post("/notificar-pedido", autenticar, async (req, res) => {
   try {
     const { pedidoKey, evento } = req.body;
 
-    log("Pedido recebido:", pedidoKey, "evento:", evento, "por:", req.user.uid);
+    log("========================================");
+    log("Pedido recebido:", pedidoKey);
+    log("Evento:", evento);
+    log("Por UID:", req.user.uid);
 
     if (!pedidoKey) {
       return res.status(400).json({
@@ -185,6 +176,7 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
       });
     }
 
+    log("Lendo pedido no Firebase...");
     const pedidoSnap = await db().ref(`pedidos/${pedidoKey}`).once("value");
     const pedido = pedidoSnap.val();
 
@@ -194,6 +186,8 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
         error: "Pedido não encontrado."
       });
     }
+
+    log("Pedido encontrado. lojaId:", pedido.lojaId);
 
     const lojaSnap = await db().ref(`restaurantes/${pedido.lojaId}`).once("value");
     const loja = lojaSnap.val();
@@ -214,6 +208,9 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
       });
     }
 
+    log("Destino UID:", destinoUid);
+    log("Buscando tokens...");
+
     const tokensSnap = await db().ref(`fcm_tokens/${destinoUid}`).once("value");
     const tokensObj = tokensSnap.val() || {};
 
@@ -223,23 +220,51 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
 
     log("Tokens encontrados:", tokens.length, "para:", destinoUid);
 
-    const titulo =
-      evento === "aceptado"
-        ? "Pedido aceptado"
-        : "Pedido despachado";
+    if (tokens.length === 0) {
+      const registroSemToken = {
+        criadoEm: new Date().toISOString(),
+        destinoUid,
+        porUid: req.user.uid,
+        resultado: {
+          enviados: 0,
+          falhas: 0,
+          tokens: 0,
+          semToken: true
+        }
+      };
 
-    const corpo =
-      evento === "aceptado"
-        ? "Tu pedido fue aceptado por la tienda."
-        : "Tu pedido ya está en camino.";
+      await db().ref(`notificaciones_pedidos/${pedidoKey}/${evento}`).set(registroSemToken);
 
-    let enviados = 0;
-    let falhas = 0;
+      log("Nenhum token. Encerrando envio.");
+      return res.json({
+        ok: true,
+        pedidoKey,
+        evento,
+        destinoUid,
+        ...registroSemToken.resultado
+      });
+    }
+
+    const titulo = evento === "aceptado"
+      ? "Pedido aceptado"
+      : "Pedido despachado";
+
+    const corpo = evento === "aceptado"
+      ? "Tu pedido fue aceptado por la tienda."
+      : "Tu pedido ya está en camino.";
+
+    const enviados = [];
+    const falhas = [];
     const invalidos = [];
 
-    if (tokens.length > 0) {
-      const response = await admin.messaging().sendEachForMulticast({
-        tokens,
+    log("Preparando envio FCM para", tokens.length, "token(s)...");
+    log("Usando send() individual para diagnóstico.");
+
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i];
+
+      const message = {
+        token,
         notification: {
           title: titulo,
           body: corpo
@@ -254,31 +279,43 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
             link: process.env.APP_URL || "/"
           }
         }
-      });
+      };
 
-      enviados = response.successCount;
-      falhas = response.failureCount;
+      log(`Enviando FCM ${i + 1}/${tokens.length}...`);
 
-      response.responses.forEach((item, index) => {
-        if (!item.success) {
-          const code = item.error?.code || "";
-          if (
-            code.includes("registration-token-not-registered") ||
-            code.includes("invalid-registration-token")
-          ) {
-            invalidos.push(tokens[index]);
-          }
-          console.error(
-            "[NotPush] Falha FCM:",
-            code,
-            item.error?.message || ""
-          );
+      try {
+        const messageId = await comTimeout(
+          admin.messaging().send(message),
+          20000,
+          "Envio FCM"
+        );
+
+        enviados.push(messageId);
+        log(`FCM OK ${i + 1}/${tokens.length}:`, messageId);
+      } catch (err) {
+        const code = err?.code || "unknown";
+        const messageText = err?.message || String(err);
+
+        falhas.push({
+          index: i,
+          code,
+          message: messageText
+        });
+
+        console.error(`[NotPush] FCM ERRO ${i + 1}/${tokens.length}:`, code, messageText);
+
+        if (
+          code.includes("registration-token-not-registered") ||
+          code.includes("invalid-registration-token")
+        ) {
+          invalidos.push(token);
         }
-      });
-
-      for (const token of invalidos) {
-        await db().ref(`fcm_tokens/${destinoUid}/${hashToken(token)}`).remove();
       }
+    }
+
+    for (const token of invalidos) {
+      await db().ref(`fcm_tokens/${destinoUid}/${hashToken(token)}`).remove();
+      log("Token inválido removido.");
     }
 
     const registro = {
@@ -286,24 +323,29 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
       destinoUid,
       porUid: req.user.uid,
       resultado: {
-        enviados,
-        falhas,
+        enviados: enviados.length,
+        falhas: falhas.length,
         tokens: tokens.length,
-        semToken: tokens.length === 0
+        semToken: false,
+        messageIds: enviados,
+        erros: falhas
       }
     };
 
     await db().ref(`notificaciones_pedidos/${pedidoKey}/${evento}`).set(registro);
 
+    log("RESULTADO FINAL:", JSON.stringify(registro.resultado));
+    log("========================================");
+
     return res.json({
-      ok: true,
+      ok: falhas.length === 0,
       pedidoKey,
       evento,
       destinoUid,
       ...registro.resultado
     });
   } catch (err) {
-    console.error("[NotPush] Erro /notificar-pedido:", err);
+    console.error("[NotPush] ERRO GERAL /notificar-pedido:", err);
     return res.status(500).json({
       ok: false,
       error: err.message
