@@ -6,8 +6,13 @@ const crypto = require("crypto");
 
 const app = express();
 
+const ORIGENS_PERMITIDAS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",").map(o => o.trim()).filter(Boolean);
+
 app.use(cors({
-  origin: true,
+  origin: ORIGENS_PERMITIDAS.length
+    ? (origin, cb) => (!origin || ORIGENS_PERMITIDAS.includes(origin)) ? cb(null, true) : cb(new Error("Origem não permitida."))
+    : true,
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
@@ -26,13 +31,18 @@ try {
 
   const serviceAccount = JSON.parse(raw);
 
+  if (process.env.EXPECTED_PROJECT_ID && serviceAccount.project_id !== process.env.EXPECTED_PROJECT_ID) {
+    throw new Error(`Projeto Firebase inesperado: ${serviceAccount.project_id} (esperado ${process.env.EXPECTED_PROJECT_ID}).`);
+  }
+
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
     databaseURL: process.env.FIREBASE_DATABASE_URL
   });
 
   firebaseReady = true;
-  log("Firebase Admin conectado.");
+  log("Firebase Admin conectado ao projeto:", serviceAccount.project_id);
+  if (!ORIGENS_PERMITIDAS.length) log("AVISO: ALLOWED_ORIGINS não configurado; qualquer origem é aceita.");
 } catch (err) {
   console.error("[NotPush] Erro ao inicializar Firebase:", err.message);
 }
@@ -66,8 +76,12 @@ function hashToken(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
-function eventoValido(evento) {
-  return evento === "novo" || evento === "aceptado" || evento === "despachado";
+// O app atual envia "novo", "aceptado" e "despachado". Os nomes PT-BR ("aceito", "enviado")
+// também são aceitos. A chave gravada no Firebase continua sendo a do app (compatível com dados existentes).
+const ALIAS_EVENTO = { novo: "novo", aceptado: "aceptado", aceito: "aceptado", despachado: "despachado", enviado: "despachado" };
+
+function normalizarEvento(evento) {
+  return ALIAS_EVENTO[String(evento || "").toLowerCase()] || null;
 }
 
 function comTimeout(promise, ms, label) {
@@ -301,11 +315,12 @@ app.post("/notificar-master", autenticar, async (req, res) => {
 
 app.post("/notificar-pedido", autenticar, async (req, res) => {
   try {
-    const { pedidoKey, evento } = req.body;
+    const { pedidoKey } = req.body;
+    const evento = normalizarEvento(req.body.evento);
 
     log("========================================");
     log("Pedido recebido:", pedidoKey);
-    log("Evento:", evento);
+    log("Evento:", evento, "(recebido:", req.body.evento, ")");
     log("Por UID:", req.user.uid);
 
     if (!pedidoKey) {
@@ -315,10 +330,10 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
       });
     }
 
-    if (!eventoValido(evento)) {
+    if (!evento) {
       return res.status(400).json({
         ok: false,
-        error: "Evento inválido. Use novo, aceptado ou despachado."
+        error: "Evento inválido. Use novo, aceito (ou aceptado) ou despachado (ou enviado)."
       });
     }
 
@@ -376,6 +391,13 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
       });
     }
 
+    const anteriorSnap = await db().ref(`notificaciones_pedidos/${pedidoKey}/${evento}`).once("value");
+    const anterior = anteriorSnap.val();
+    if (anterior?.resultado?.enviados > 0) {
+      log("Evento já enviado antes; ignorando duplicado.");
+      return res.json({ ok: true, pedidoKey, evento, destinoUid, duplicado: true });
+    }
+
     log("Destino UID:", destinoUid);
     log("Buscando tokens...");
 
@@ -414,14 +436,14 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
     }
 
     const titulo = evento === "novo"
-      ? "Nuevo pedido"
-      : (evento === "aceptado" ? "Pedido aceptado" : "Pedido despachado");
+      ? "Novo pedido"
+      : (evento === "aceptado" ? "Pedido aceito" : "Pedido saiu para entrega");
 
     const corpo = evento === "novo"
-      ? `Has recibido un nuevo pedido${pedido.numeroPedido ? ` #${pedido.numeroPedido}` : ""}.`
+      ? `Você recebeu um novo pedido${pedido.numeroPedido ? ` #${pedido.numeroPedido}` : ""}.`
       : (evento === "aceptado"
-        ? "Tu pedido fue aceptado por la tienda."
-        : "Tu pedido ya está en camino.");
+        ? "Seu pedido foi aceito pela loja."
+        : "Seu pedido saiu para entrega.");
 
     const enviados = [];
     const falhas = [];
