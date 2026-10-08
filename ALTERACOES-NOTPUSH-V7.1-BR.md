@@ -18,3 +18,6 @@ Texto fixo: `🎟️ Cupom CODIGO — Loja` / `10% de desconto em pedidos a part
 Registros gravados (só pelo servidor): `notificaciones_cupons/{lojaId}/{cupomId}`, `notificaciones_cupons_dia/{dia}/{lojaId}`, `notificaciones_cupons_total/{dia}`.
 
 Testes: `npm test` (novas seções 1b e 9b).
+
+## V7.1.1 — validade do cupom
+- `cupomElegivel` agora recusa cupom com `inicioEm` no futuro ou `fimEm` no passado (datas AAAA-MM-DD, fim inclusivo, dia de Brasília). O aviso de cupom não é enviado para cupom vencido ou agendado.

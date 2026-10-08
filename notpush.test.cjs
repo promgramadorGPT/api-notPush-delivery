@@ -44,6 +44,25 @@ const N = require('../notificacoes');
   assert.strictEqual(N.resolverDestino('atribuido', { ...base, uid: 'dono', entrega: ent, entregador: { lojaId: 'L9', ativo: true } }).status, 409);
   assert.strictEqual(N.resolverDestino('atribuido', { ...base, uid: 'dono', entrega: null }).status, 409);
   console.log('ok 1 regras puras do NotPush');
+  // V7.1 cupom — regras puras
+  assert.strictEqual(N.diaBrasilia(Date.UTC(2026, 9, 8, 2, 59)), '2026-10-07'); // 23:59 em Brasília ainda é dia 7
+  assert.strictEqual(N.diaBrasilia(Date.UTC(2026, 9, 8, 3, 0)), '2026-10-08');
+  assert.deepStrictEqual(N.configCupom(null), { ativo: true, limiteDiario: N.LIMITE_DIARIO_PADRAO });
+  assert.deepStrictEqual(N.configCupom({ ativo: false, limiteDiario: 10 }), { ativo: false, limiteDiario: 10 });
+  assert.strictEqual(N.configCupom({ limiteDiario: -3 }).limiteDiario, N.LIMITE_DIARIO_PADRAO);
+  assert.strictEqual(N.cupomElegivel({ codigo: 'PROMO10', tipo: 'porcentagem', valor: 10 }), true);
+  assert.strictEqual(N.cupomElegivel({ codigo: 'PROMO10', tipo: 'porcentagem', valor: 10, ativo: false }), false);
+  assert.strictEqual(N.cupomElegivel({ codigo: 'PROMO10', tipo: 'porcentagem', valor: 0 }), false);
+  assert.strictEqual(N.cupomElegivel({ codigo: 'PROMO10', tipo: 'porcentagem', valor: 150 }), false);
+  assert.strictEqual(N.cupomElegivel({ codigo: 'ab', tipo: 'fixo', valor: 5 }), false);
+  assert.strictEqual(N.cupomElegivel({ codigo: 'FRETE', tipo: 'frete_gratis' }), true);
+  assert.strictEqual(N.cupomElegivel({ codigo: 'FRETE', tipo: 'outro' }), false);
+  assert.deepStrictEqual(N.publicoDaLoja({ a: { clienteUid: 'u1' }, b: { clienteUid: 'u1' }, c: { clienteUid: 'u2' }, d: { clienteUid: 'bloq' }, e: {} }, { bloq: true }).sort(), ['u1', 'u2']);
+  assert.strictEqual(N.restanteDoDia(100, 30), 70); assert.strictEqual(N.restanteDoDia(10, 50), 0);
+  const av = N.montarAvisoCupom({ lojaId: 'L1', loja: { nombre: 'Pizzaria A' }, cupom: { codigo: 'PROMO10', tipo: 'porcentagem', valor: 10, minimo: 30 } });
+  assert.strictEqual(av.titulo, '🎟️ Cupom PROMO10 — Pizzaria A'); assert.match(av.corpo, /10% de desconto em pedidos a partir de R\$ 30,00/); assert.strictEqual(av.caminho, 'restaurante.html?id=L1');
+  assert.match(N.montarAvisoCupom({ lojaId: 'L1', cupom: { codigo: 'FRETE', tipo: 'frete_gratis' } }).corpo, /Entrega grátis/);
+  console.log('ok 1b regras puras do aviso de cupom');
 }
 
 // ---- 2) rotas ----
@@ -55,6 +74,7 @@ const mkRef = (p) => ({
   once: async () => { const v = getAt(p); const c = v === undefined ? null : JSON.parse(JSON.stringify(v)); return { val: () => c, exists: () => c !== null }; },
   set: async (v) => setAt(p, v),
   remove: async () => setAt(p, null),
+  orderByChild: (k) => ({ equalTo: (v) => ({ limitToLast: () => ({ once: async () => { const todos = getAt(p) || {}; const f = Object.fromEntries(Object.entries(todos).filter(([, x]) => x && x[k] === v)); return { val: () => (Object.keys(f).length ? f : null) }; } }) }) }),
   transaction: async (fn) => { const cur = getAt(p); const r = fn(cur === undefined ? null : JSON.parse(JSON.stringify(cur))); if (r === undefined) return { committed: false }; setAt(p, r); return { committed: true }; }
 });
 const fcm = { enviadas: [], falhar: new Set(), atraso: 0 };
@@ -202,6 +222,63 @@ const hash = (t) => crypto.createHash('sha256').update(t).digest('hex');
   assert.ok(getAt('notificaciones_master/c1'));
   console.log('ok 9 campanha do Master (valida link, não repete aparelho)');
 
+  // V7.1 — aviso automático de cupom
+  setAt('restaurantes/L5', { ownerUid: 'dono5', nombre: 'Loja Cinco' });
+  setAt('restaurantes/L5/cupones/C1', { codigo: 'PROMO10', titulo: '10% off', tipo: 'porcentagem', valor: 10, minimo: 0, ativo: true });
+  setAt('restaurantes/L5/cupones/C2', { codigo: 'OFF5', tipo: 'fixo', valor: 5, ativo: true });
+  setAt('restaurantes/L5/cupones/C3', { codigo: 'VELHO', tipo: 'fixo', valor: 5, ativo: false });
+  setAt('restaurantes/L2', { ownerUid: 'dono2', nombre: 'Loja Dois', cupones: { C9: { codigo: 'OUTRO', tipo: 'fixo', valor: 3 } } });
+  setAt('pedidos/Q1', { lojaId: 'L5', clienteUid: 'fiel1' }); setAt('pedidos/Q2', { lojaId: 'L5', clienteUid: 'fiel2' }); setAt('pedidos/Q3', { lojaId: 'L5', clienteUid: 'fiel1' });
+  setAt('pedidos/Q4', { lojaId: 'L5', clienteUid: 'bloqueado' }); setAt('pedidos/Q5', { lojaId: 'L2', clienteUid: 'deOutraLoja' });
+  setAt('usuarios_bloqueados/bloqueado', true);
+  const body = (c) => ({ lojaId: 'L5', cupomId: c });
+  assert.strictEqual((await call('POST /notificar-cupom', { uid: 'dono5', body: { lojaId: '../x', cupomId: 'C1' } })).code, 400);
+  assert.strictEqual((await call('POST /notificar-cupom', { uid: 'estranho', body: body('C1') })).code, 403, 'só o dono da loja');
+  assert.strictEqual((await call('POST /notificar-cupom', { uid: 'dono5', body: body('NAO') })).code, 404);
+  assert.strictEqual((await call('POST /notificar-cupom', { uid: 'dono5', body: body('C3') })).body.motivo, 'cupom-inativo');
+  // sem ninguém com aparelho: não gasta o aviso do dia
+  r = await call('POST /notificar-cupom', { uid: 'dono5', body: body('C1') });
+  assert.strictEqual(r.body.motivo, 'sem-aparelhos'); assert.strictEqual(r.body.clientes, 2); assert.strictEqual(getAt('notificaciones_cupons/L5/C1'), undefined);
+  await call('POST /registrar-token', { uid: 'fiel1', body: { token: tk(31) } });
+  await call('POST /registrar-token', { uid: 'fiel2', body: { token: tk(32) } });
+  await call('POST /registrar-token', { uid: 'bloqueado', body: { token: tk(33) } });
+  await call('POST /registrar-token', { uid: 'deOutraLoja', body: { token: tk(34) } });
+  // Master desliga
+  setAt('config_plataforma/push_cupom', { ativo: false });
+  assert.strictEqual((await call('POST /notificar-cupom', { uid: 'dono5', body: body('C1') })).body.motivo, 'desligado');
+  setAt('config_plataforma/push_cupom', { ativo: true, limiteDiario: 1 });
+  // teto diário menor que o público: envia só o que cabe e avisa
+  r = await call('POST /notificar-cupom', { uid: 'dono5', body: body('C1') });
+  assert.strictEqual(r.body.enviados, 1); assert.strictEqual(r.body.cortadoPeloTeto, true);
+  // segundo cupom no mesmo dia: barrado (1 por dia por loja)
+  setAt('config_plataforma/push_cupom', { ativo: true, limiteDiario: 100 });
+  assert.strictEqual((await call('POST /notificar-cupom', { uid: 'dono5', body: body('C2') })).body.motivo, 'limite-loja');
+  assert.strictEqual(getAt('notificaciones_cupons/L5/C2'), undefined, 'a reserva do cupom barrado foi liberada');
+  // mesmo cupom de novo: já avisado
+  assert.strictEqual((await call('POST /notificar-cupom', { uid: 'dono5', body: body('C1') })).body.motivo, 'cupom-ja-avisado');
+  // novo dia: outro cupom sai para todos do público (menos bloqueado e cliente de outra loja)
+  const dia = N.diaBrasilia(); const hoje = getAt(`notificaciones_cupons_dia/${dia}`); setAt(`notificaciones_cupons_dia/${dia}`, null); setAt(`notificaciones_cupons_total/${dia}`, null);
+  const c0 = fcm.enviadas.length;
+  r = await call('POST /notificar-cupom', { uid: 'dono5', body: body('C2') });
+  assert.strictEqual(r.body.enviados, 2); assert.strictEqual(r.body.cortadoPeloTeto, false);
+  const dest = fcm.enviadas.slice(c0).map((x) => x.token).sort();
+  assert.deepStrictEqual(dest, [tk(31), tk(32)].sort(), 'só quem já pediu na loja e não está bloqueado');
+  m = fcm.enviadas.at(-1);
+  assert.strictEqual(m.notification.title, '🎟️ Cupom OFF5 — Loja Cinco'); assert.match(m.notification.body, /R\$ 5,00 de desconto/);
+  assert.strictEqual(m.data.url, 'https://app.exemplo.com.br/restaurante.html?id=L5'); assert.strictEqual(m.data.tipo, 'cupom');
+  assert.ok(Object.values(m.data).every((v) => typeof v === 'string'));
+  // loja suspensa não envia
+  setAt(`notificaciones_cupons_dia/${dia}`, null); setAt('lojas_suspensas/L5', { em: 'x' });
+  assert.strictEqual((await call('POST /notificar-cupom', { uid: 'dono5', body: body('C1') })).body.motivo, 'loja-inativa');
+  setAt('lojas_suspensas/L5', null);
+  // duas chamadas ao mesmo tempo: um só envio
+  setAt('restaurantes/L5/cupones/C4', { codigo: 'SIMUL', tipo: 'fixo', valor: 2, ativo: true }); setAt(`notificaciones_cupons_dia/${dia}`, null);
+  fcm.atraso = 30; const s0 = fcm.enviadas.length;
+  const dois = await Promise.all([1, 2].map(() => call('POST /notificar-cupom', { uid: 'dono5', body: body('C4') })));
+  fcm.atraso = 0;
+  assert.strictEqual(fcm.enviadas.length - s0, 2, 'público recebe uma vez só'); assert.ok(dois.some((x) => x.body.motivo));
+  console.log('ok 9b aviso automático de cupom (dono, público, 1/dia, teto, chave do Master, sem duplicar)');
+
   // erro interno não vaza detalhes
   const real = mocks['firebase-admin'].database; mocks['firebase-admin'].database = () => { throw new Error('segredo interno do banco'); };
   r = await call('POST /notificar-pedido', { uid: 'cli', body: { pedidoKey: 'P1', evento: 'novo' } });
@@ -211,3 +288,15 @@ const hash = (t) => crypto.createHash('sha256').update(t).digest('hex');
   console.log('TODOS OS TESTES DO NOTPUSH PASSARAM');
   process.exit(0);
 })().catch((e) => { console.error(e); process.exit(1); });
+
+// ---- cupom: validade (V7.1.1) ----
+{
+  const base = { codigo: 'PROMO10', tipo: 'porcentagem', valor: 10 };
+  const dia = (iso) => Date.parse(`${iso}T15:00:00Z`); // 12h em Brasília
+  assert.strictEqual(N.cupomElegivel({ ...base, inicioEm: '2026-06-10', fimEm: '2026-06-20' }, dia('2026-06-09')), false);
+  assert.strictEqual(N.cupomElegivel({ ...base, inicioEm: '2026-06-10', fimEm: '2026-06-20' }, dia('2026-06-10')), true);
+  assert.strictEqual(N.cupomElegivel({ ...base, inicioEm: '2026-06-10', fimEm: '2026-06-20' }, dia('2026-06-20')), true);
+  assert.strictEqual(N.cupomElegivel({ ...base, fimEm: '2026-06-20' }, dia('2026-06-21')), false);
+  assert.strictEqual(N.cupomElegivel(base, dia('2030-01-01')), true);
+  console.log('ok cupom: validade');
+}
