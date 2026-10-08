@@ -1,11 +1,11 @@
 {
   "name": "notpush-delivery",
-  "version": "7.2.0",
+  "version": "7.3.0",
   "private": true,
   "main": "serve.js",
   "scripts": {
     "start": "node serve.js",
-    "test": "node tests/notpush.test.cjs"
+    "test": "node tests/notpush.test.cjs && node tests/cadastro.test.cjs"
   },
   "engines": {
     "node": ">=18"

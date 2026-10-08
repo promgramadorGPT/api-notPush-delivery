@@ -6,7 +6,7 @@ const admin = require("firebase-admin");
 const crypto = require("crypto");
 const N = require("./notificacoes");
 
-const VERSAO = "7.1.0";
+const VERSAO = "7.3.0";
 const MAX_TOKENS_POR_USUARIO = 10;
 const app = express();
 
@@ -304,6 +304,87 @@ app.post("/notificar-master", autenticar, async (req, res) => {
     log("MASTER RESULTADO:", JSON.stringify({ ...resultado, messageIds: undefined, erros: undefined }));
     return res.json({ ok: falhas.length === 0, campanhaId: campanha, ...resultado });
   } catch (err) { return erroInterno(res, "/notificar-master", err); }
+});
+
+// ---------------- V7.3: cadastro de lojista ----------------
+// 'novo'      → o próprio lojista acabou de enviar o cadastro: avisa os aparelhos dos Masters (1 vez por envio).
+// 'analisado' → o Master aprovou/recusou: avisa o lojista por push e por e-mail (cada um 1 vez por decisão).
+// O e-mail sai pelo Resend (https://resend.com) quando RESEND_API_KEY e EMAIL_FROM estão configurados; sem eles só o push é enviado.
+async function enviarEmail({ para, assunto, texto }) {
+  const chave = String(process.env.RESEND_API_KEY || "").trim(), de = String(process.env.EMAIL_FROM || "").trim();
+  if (!chave || !de) return { enviado: false, motivo: "e-mail não configurado no servidor" };
+  if (!para) return { enviado: false, motivo: "o lojista não tem e-mail na conta" };
+  try {
+    const r = await comTimeout(fetch("https://api.resend.com/emails", {
+      method: "POST", headers: { Authorization: `Bearer ${chave}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ from: de, to: [para], subject: assunto, text: texto })
+    }), 15000, "Envio de e-mail");
+    if (!r.ok) { console.error("[NotPush] e-mail recusado:", r.status, await r.text().catch(() => "")); return { enviado: false, motivo: `o serviço de e-mail recusou (${r.status})` }; }
+    return { enviado: true };
+  } catch (err) { console.error("[NotPush] e-mail erro:", err.message); return { enviado: false, motivo: "falha ao enviar o e-mail" }; }
+}
+
+/** Marca um envio como feito (transação): devolve false se já existia. */
+async function reservarUnico(caminho) {
+  const t = await db().ref(caminho).transaction(atual => (atual ? undefined : { reservadoEm: Date.now() }));
+  return t.committed;
+}
+
+app.post("/notificar-cadastro", autenticar, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    if (!limite("cad:" + uid)) return res.status(429).json({ ok: false, error: "Muitas tentativas. Aguarde um minuto." });
+    const evento = String(req.body?.evento || "");
+
+    if (evento === "novo") {
+      const cad = await lerValor(`lojistas_cadastro/${uid}`);
+      if (!cad || cad.status !== "pendente") return res.status(404).json({ ok: false, error: "Cadastro pendente não encontrado." });
+      const chave = N.chaveCadastro("novo", cad);
+      if (!chave) return res.status(409).json({ ok: false, error: "Cadastro sem data de envio." });
+      const caminho = `notificaciones_cadastros/${uid}/${chave}`;
+      if (!(await reservarUnico(caminho))) return res.json({ ok: true, evento, duplicado: true });
+      const admins = (await lerValor("admins")) || {};
+      const masters = Object.entries(admins).filter(([, a]) => a?.role === "master").map(([m]) => m);
+      const aviso = N.avisoCadastro("novo", cad);
+      let enviados = 0, falhas = 0;
+      for (const m of masters) {
+        try { const r = await enviarParaUsuario(m, aviso, { tipo: "cadastro", evento: "novo", lojistaUid: uid, tag: `cadastro:${uid}:novo` }); enviados += r.enviados; falhas += r.falhas; }
+        catch (err) { falhas++; console.error("[NotPush] cadastro novo → master:", err.message); }
+      }
+      await db().ref(caminho).set({ criadoEm: new Date().toISOString(), porUid: uid, resultado: { masters: masters.length, enviados, falhas } });
+      log("CADASTRO novo:", uid, JSON.stringify({ masters: masters.length, enviados, falhas }));
+      return res.json({ ok: true, evento, masters: masters.length, enviados, falhas });
+    }
+
+    if (evento === "analisado") {
+      if ((await lerValor(`admins/${uid}/role`)) !== "master") return res.status(403).json({ ok: false, error: "Usuário não é Master." });
+      const alvo = req.body?.uid;
+      if (!idSeguro(alvo)) return res.status(400).json({ ok: false, error: "Lojista inválido." });
+      const cad = await lerValor(`lojistas_cadastro/${alvo}`);
+      if (!cad || (cad.status !== "aprovado" && cad.status !== "recusado")) return res.status(409).json({ ok: false, error: "O cadastro ainda não foi decidido." });
+      const chave = N.chaveCadastro("analisado", cad);
+      if (!chave) return res.status(409).json({ ok: false, error: "Cadastro sem data de análise." });
+      const base = `notificaciones_cadastros/${alvo}/${chave}`;
+
+      let push = { duplicado: true };
+      if (await reservarUnico(`${base}_push`)) {
+        try { push = await enviarParaUsuario(alvo, N.avisoCadastro("analisado", cad), { tipo: "cadastro", evento: cad.status, tag: `cadastro:${alvo}:${cad.status}` }); }
+        catch (err) { console.error("[NotPush] cadastro push:", err.message); push = { enviados: 0, falhas: 1 }; await db().ref(`${base}_push`).remove().catch(() => {}); }
+      }
+      let email = { duplicado: true };
+      if (await reservarUnico(`${base}_email`)) {
+        let para = "";
+        try { para = (await admin.auth().getUser(alvo)).email || ""; } catch { /* usa o e-mail do cadastro */ }
+        const t = N.emailCadastro(cad, process.env.APP_URL || "");
+        email = await enviarEmail({ para: para || cad.email || "", assunto: t.assunto, texto: t.texto });
+        if (!email.enviado) await db().ref(`${base}_email`).remove().catch(() => {});   // libera nova tentativa se não saiu
+      }
+      log("CADASTRO analisado:", alvo, cad.status, JSON.stringify({ push: push.enviados, email: email.enviado }));
+      return res.json({ ok: true, evento, status: cad.status, push: { enviados: push.enviados || 0, falhas: push.falhas || 0, duplicado: !!push.duplicado }, email: { enviado: !!email.enviado, motivo: email.motivo || null, duplicado: !!email.duplicado } });
+    }
+
+    return res.status(400).json({ ok: false, error: "Evento inválido. Use novo ou analisado." });
+  } catch (err) { return erroInterno(res, "/notificar-cadastro", err); }
 });
 
 // ---------------- Aviso automático de cupom (V7.1) ----------------

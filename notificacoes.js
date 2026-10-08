@@ -192,7 +192,35 @@ function avisoPresente({ loja = {} } = {}) {
   return { titulo: 'Você ganhou um presente! 🎁', corpo: `${nome} preparou uma surpresa para você. Abra o app para descobrir.`, caminho: 'pedidos.html' };
 }
 
+// ---------- V7.3: cadastro de lojista (análise do Master) ----------
+/** Chave do evento: cada reenvio do cadastro (enviadoEm) e cada decisão (analisadoEm) avisa uma única vez. */
+function chaveCadastro(evento, cad) {
+  const base = evento === 'novo' ? cad?.enviadoEm : cad?.analisadoEm;
+  const t = String(base || '').replace(/[^0-9A-Za-z]/g, '').slice(0, 30);
+  return t ? `${evento}_${t}` : null;
+}
+
+/** Aviso (push) do cadastro. evento 'novo' → para o Master; 'analisado' → para o lojista. */
+function avisoCadastro(evento, cad = {}) {
+  if (evento === 'novo') {
+    const loja = limparTexto(cad.nomeLoja, 60) || 'Nova loja';
+    return { titulo: 'Novo cadastro de lojista', corpo: `${loja} — ${limparTexto(cad.nomeCompleto, 60)} aguarda a sua análise.`, caminho: 'master.html#cadastros' };
+  }
+  if (cad.status === 'aprovado') return { titulo: 'Cadastro aprovado! 🎉', corpo: 'Você já pode criar a sua loja no YaPOOD. Toque para começar.', caminho: 'admin-loja.html' };
+  return { titulo: 'Cadastro não aprovado', corpo: `Motivo: ${limparTexto(cad.motivoRecusa, 160) || 'veja no aplicativo'}. Corrija os dados e envie de novo.`, caminho: 'admin-loja.html' };
+}
+
+/** E-mail da decisão (texto simples). */
+function emailCadastro(cad = {}, appUrl = '') {
+  const primeiro = limparTexto(cad.nomeCompleto, 60).split(' ')[0] || 'tudo bem';
+  const link = appUrl ? urlDoApp(appUrl, 'admin-loja.html') : '';
+  if (cad.status === 'aprovado') {
+    return { assunto: 'Seu cadastro no YaPOOD foi aprovado', texto: `Olá, ${primeiro}!\n\nSeu cadastro de lojista no YaPOOD foi aprovado. Agora você já pode entrar e criar a sua loja${link ? `:\n${link}` : '.'}\n\nEquipe YaPOOD` };
+  }
+  return { assunto: 'Seu cadastro no YaPOOD não foi aprovado', texto: `Olá, ${primeiro}!\n\nAnalisamos o seu cadastro de lojista e, por enquanto, não foi possível aprová-lo.\nMotivo: ${limparTexto(cad.motivoRecusa, 300) || 'veja no aplicativo'}\n\nVocê pode corrigir os dados e enviar de novo${link ? `:\n${link}` : '.'}\n\nEquipe YaPOOD` };
+}
+
 /** Quantos aparelhos ainda cabem no teto de hoje. */
 const restanteDoDia = (limite, jaEnviados) => Math.max(0, limite - (Number(jaEnviados) || 0));
 
-module.exports = { ALIAS_EVENTO, EVENTOS_PEDIDO, normalizarEvento, ehEventoDePedido, resolverDestino, chaveEvento, montarAviso, urlDoApp, tokenValido, plataformaValida, tokensExcedentes, decidirReserva, criarLimitador, limparTexto, diaBrasilia, configCupom, cupomElegivel, montarAvisoCupom, publicoDaLoja, configFidelidade, ganhouPresente, avisoPresente, restanteDoDia, LIMITE_DIARIO_PADRAO, MAX_PEDIDOS_PUBLICO };
+module.exports = { ALIAS_EVENTO, EVENTOS_PEDIDO, normalizarEvento, ehEventoDePedido, resolverDestino, chaveEvento, montarAviso, urlDoApp, tokenValido, plataformaValida, tokensExcedentes, decidirReserva, criarLimitador, limparTexto, diaBrasilia, configCupom, cupomElegivel, montarAvisoCupom, publicoDaLoja, configFidelidade, ganhouPresente, avisoPresente, restanteDoDia, chaveCadastro, avisoCadastro, emailCadastro, LIMITE_DIARIO_PADRAO, MAX_PEDIDOS_PUBLICO };
