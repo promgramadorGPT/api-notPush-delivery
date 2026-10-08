@@ -6,7 +6,7 @@ const admin = require("firebase-admin");
 const crypto = require("crypto");
 const N = require("./notificacoes");
 
-const VERSAO = "7.1.0";
+const VERSAO = "7.0.0";
 const MAX_TOKENS_POR_USUARIO = 10;
 const app = express();
 
@@ -288,118 +288,6 @@ app.post("/notificar-master", autenticar, async (req, res) => {
     log("MASTER RESULTADO:", JSON.stringify({ ...resultado, messageIds: undefined, erros: undefined }));
     return res.json({ ok: falhas.length === 0, campanhaId: campanha, ...resultado });
   } catch (err) { return erroInterno(res, "/notificar-master", err); }
-});
-
-// ---------------- Aviso automático de cupom (V7.1) ----------------
-// A loja cadastra um cupom e o NotPush avisa, no máximo 1 vez por dia por loja, os clientes que já pediram nela.
-// Tudo é conferido aqui no servidor: dono da loja, cupom ativo, loja não suspensa, chave e teto do Master.
-app.post("/notificar-cupom", autenticar, async (req, res) => {
-  let reservaDia = null, reservaCupom = null;
-  const liberar = async () => {
-    if (reservaDia) await db().ref(reservaDia).remove().catch(() => {});
-    if (reservaCupom) await db().ref(reservaCupom).remove().catch(() => {});
-  };
-  try {
-    const { lojaId, cupomId } = req.body || {};
-    const uid = req.user.uid;
-    if (!limite("cup:" + uid)) return res.status(429).json({ ok: false, error: "Muitas tentativas. Aguarde um minuto." });
-    if (!idSeguro(lojaId) || !idSeguro(cupomId)) return res.status(400).json({ ok: false, error: "Loja ou cupom inválido." });
-
-    const loja = await lerValor(`restaurantes/${lojaId}`);
-    if (!loja || !loja.ownerUid) return res.status(404).json({ ok: false, error: "Loja não encontrada." });
-    if (loja.ownerUid !== uid) return res.status(403).json({ ok: false, error: "Usuário não é proprietário desta loja." });
-    if (loja.activo === false || (await lerValor(`lojas_suspensas/${lojaId}`)) != null) return res.json({ ok: true, enviados: 0, tokens: 0, motivo: "loja-inativa", mensagem: "A loja está desativada, então o aviso não foi enviado." });
-
-    const cupom = await lerValor(`restaurantes/${lojaId}/cupones/${cupomId}`);
-    if (!cupom) return res.status(404).json({ ok: false, error: "Cupom não encontrado." });
-    if (!N.cupomElegivel(cupom)) return res.json({ ok: true, enviados: 0, tokens: 0, motivo: "cupom-inativo", mensagem: "O cupom está inativo ou incompleto, então o aviso não foi enviado." });
-
-    const cfg = N.configCupom(await lerValor("config_plataforma/push_cupom"));
-    if (!cfg.ativo) return res.json({ ok: true, enviados: 0, tokens: 0, motivo: "desligado", mensagem: "O aviso automático de cupom está desligado pela plataforma." });
-
-    const agora = Date.now();
-    const dia = N.diaBrasilia(agora);
-
-    // 1 aviso por dia por loja e 1 por cupom (transações: duas chamadas simultâneas não passam as duas)
-    reservaCupom = `notificaciones_cupons/${lojaId}/${cupomId}`;
-    const rc = await reservar(reservaCupom);
-    if (!rc.ok) { reservaCupom = null; return res.json({ ok: true, enviados: 0, tokens: 0, motivo: "cupom-ja-avisado", mensagem: "Este cupom já foi avisado aos clientes." }); }
-    reservaDia = `notificaciones_cupons_dia/${dia}/${lojaId}`;
-    const rd = await reservar(reservaDia);
-    if (!rd.ok) { reservaDia = null; await liberar(); return res.json({ ok: true, enviados: 0, tokens: 0, motivo: "limite-loja", mensagem: "Esta loja já avisou clientes sobre um cupom hoje. Tente amanhã." }); }
-
-    // Público: quem já pediu nesta loja (pedidos recentes), sem contas bloqueadas
-    const snap = await db().ref("pedidos").orderByChild("lojaId").equalTo(lojaId).limitToLast(N.MAX_PEDIDOS_PUBLICO).once("value");
-    const bloqueados = (await lerValor("usuarios_bloqueados")) || {};
-    const clientes = N.publicoDaLoja(snap.val(), bloqueados);
-
-    const tokensTodos = [];
-    const vistos = new Set();
-    for (const cli of clientes) {
-      const obj = (await lerValor(`fcm_tokens/${cli}`)) || {};
-      for (const [tokenId, v] of Object.entries(obj)) {
-        if (v?.token && !vistos.has(v.token)) { vistos.add(v.token); tokensTodos.push({ uid: cli, tokenId, token: v.token }); }
-      }
-    }
-    if (!tokensTodos.length) {
-      await liberar(); // ninguém para avisar: não gasta o aviso do dia
-      return res.json({ ok: true, clientes: clientes.length, enviados: 0, tokens: 0, motivo: "sem-aparelhos", mensagem: clientes.length ? "Nenhum cliente desta loja com notificações ativadas ainda." : "Esta loja ainda não tem clientes com pedidos." });
-    }
-
-    // Teto diário da plataforma (soma das lojas)
-    let permitidos = 0;
-    const t = await db().ref(`notificaciones_cupons_total/${dia}`).transaction(atual => {
-      const restante = N.restanteDoDia(cfg.limiteDiario, atual?.aparelhos);
-      permitidos = Math.min(restante, tokensTodos.length);
-      if (permitidos <= 0) return undefined;
-      return { aparelhos: (Number(atual?.aparelhos) || 0) + permitidos };
-    });
-    if (!t.committed || permitidos <= 0) { await liberar(); return res.json({ ok: true, enviados: 0, tokens: tokensTodos.length, motivo: "teto-diario", mensagem: "O teto diário de avisos da plataforma foi atingido. Tente amanhã." }); }
-    const tokens = tokensTodos.slice(0, permitidos);
-
-    const aviso = N.montarAvisoCupom({ lojaId, loja, cupom });
-    const baseLink = N.urlDoApp(process.env.APP_URL || "", aviso.caminho);
-    const https = baseLink.startsWith("https://");
-    const icone = https ? N.urlDoApp(process.env.APP_URL, "icons/icons-192.png") : undefined;
-    const tag = `cupom:${lojaId}:${cupomId}`;
-    const enviados = [], falhas = [], invalidos = [];
-    for (let inicio = 0; inicio < tokens.length; inicio += 500) {
-      const lote = tokens.slice(inicio, inicio + 500);
-      const messages = lote.map(item => ({
-        token: item.token,
-        notification: { title: aviso.titulo, body: aviso.corpo },
-        data: { tipo: "cupom", lojaId, cupomId, url: baseLink, link: baseLink, tag },
-        webpush: { notification: { ...(icone ? { icon: icone, badge: icone } : {}), tag }, ...(https ? { fcmOptions: { link: baseLink } } : {}) }
-      }));
-      try {
-        const response = await comTimeout(admin.messaging().sendEach(messages), 30000, "Envio FCM Cupom");
-        response.responses.forEach((r, i) => {
-          const item = lote[i];
-          if (r.success) { enviados.push(r.messageId); return; }
-          const code = r.error?.code || "unknown";
-          falhas.push({ uid: item.uid, tokenId: item.tokenId, code });
-          if (code.includes("registration-token-not-registered") || code.includes("invalid-registration-token")) invalidos.push(item);
-        });
-      } catch (err) {
-        console.error("[NotPush] Cupom FCM lote erro:", err.message);
-        for (const item of lote) falhas.push({ uid: item.uid, tokenId: item.tokenId, code: err?.code || "batch-error" });
-      }
-    }
-    for (const item of invalidos) {
-      await db().ref(`fcm_tokens/${item.uid}/${item.tokenId}`).remove().catch(() => {});
-      await db().ref(`fcm_token_owner/${item.tokenId}`).remove().catch(() => {});
-    }
-    const resultado = { clientes: clientes.length, tokens: tokens.length, enviados: enviados.length, falhas: falhas.length, cortadoPeloTeto: tokens.length < tokensTodos.length };
-    const registro = { criadoEm: new Date().toISOString(), porUid: uid, resultado };
-    await db().ref(`notificaciones_cupons/${lojaId}/${cupomId}`).set(registro);
-    await db().ref(`notificaciones_cupons_dia/${dia}/${lojaId}`).set({ ...registro, cupomId });
-    reservaDia = null; reservaCupom = null;
-    log("CUPOM RESULTADO:", lojaId, cupomId, JSON.stringify(resultado));
-    return res.json({ ok: true, ...resultado, mensagem: `Aviso enviado para ${resultado.enviados} aparelho(s) de clientes da loja.` });
-  } catch (err) {
-    await liberar();
-    return erroInterno(res, "/notificar-cupom", err);
-  }
 });
 
 const PORT = process.env.PORT || 10000;
