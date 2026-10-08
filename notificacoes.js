@@ -151,7 +151,48 @@ function publicoDaLoja(pedidosObj, bloqueados = {}) {
   return [...uids];
 }
 
+
+// ---------- Presente fidelidade (V7.2) ----------
+// Espelha js/fidelidade.js do app (configFidelidade/pedidoConta). O aviso NÃO revela o presente: é uma surpresa aberta no app.
+const entregueSt = (st) => /^(entregado|entregue|concluido|concluído|finalizado|completado)$/i.test(String(st || '').trim());
+const TIPOS_FIDELIDADE = ['frete_gratis', 'fixo', 'porcentagem', 'pedido_gratis'];
+function configFidelidade(raw) {
+  if (!raw || raw.ativo !== true) return null;
+  const meta = Math.floor(Number(raw.meta));
+  if (!(meta >= 2 && meta <= 30) || !TIPOS_FIDELIDADE.includes(raw.tipo)) return null;
+  const valor = Number(raw.valor) || 0, vMax = Number(raw.valorMaximo) || 0;
+  if (raw.tipo === 'fixo' && !(valor > 0)) return null;
+  if (raw.tipo === 'porcentagem' && !(valor > 0 && valor <= 100)) return null;
+  if (raw.tipo === 'pedido_gratis' && !(vMax > 0)) return null;
+  return { meta, minimoPedido: Number(raw.minimoPedido) || 0, inicioEm: String(raw.inicioEm || '') };
+}
+function contaParaMeta(p, cfg, comoEntregue = false) {
+  if (!p || !cfg) return false;
+  if (!comoEntregue && !entregueSt(p.status)) return false;
+  if (p.premioFidelidade) return false;
+  if (p.reembolso && p.reembolso.status === 'aprovado' && !p.reembolso.parcial) return false;
+  if (cfg.minimoPedido > 0 && (Number(p.subtotal) || 0) < cfg.minimoPedido) return false;
+  if (cfg.inicioEm && String(p.criadoEm || '') < cfg.inicioEm) return false;
+  return true;
+}
+/** Este pedido, recém-entregue, fez o cliente completar a meta (ganhou um presente novo)? `pedidosCliente`: objeto {key: pedido} do cliente. */
+function ganhouPresente({ pedidoKey, pedido, pedidosCliente, cfgRaw }) {
+  const cfg = configFidelidade(cfgRaw);
+  if (!cfg || !pedido || !pedido.clienteUid) return false;
+  if (!contaParaMeta(pedido, cfg, true)) return false;
+  let concluidos = 1;
+  for (const [k, p] of Object.entries(pedidosCliente || {})) {
+    if (k === pedidoKey || !p || p.clienteUid !== pedido.clienteUid || p.lojaId !== pedido.lojaId) continue;
+    if (contaParaMeta(p, cfg)) concluidos++;
+  }
+  return concluidos % cfg.meta === 0;
+}
+function avisoPresente({ loja = {} } = {}) {
+  const nome = limparTexto(loja.nombre || loja.nome || 'a loja', 60);
+  return { titulo: 'Você ganhou um presente! 🎁', corpo: `${nome} preparou uma surpresa para você. Abra o app para descobrir.`, caminho: 'pedidos.html' };
+}
+
 /** Quantos aparelhos ainda cabem no teto de hoje. */
 const restanteDoDia = (limite, jaEnviados) => Math.max(0, limite - (Number(jaEnviados) || 0));
 
-module.exports = { ALIAS_EVENTO, EVENTOS_PEDIDO, normalizarEvento, ehEventoDePedido, resolverDestino, chaveEvento, montarAviso, urlDoApp, tokenValido, plataformaValida, tokensExcedentes, decidirReserva, criarLimitador, limparTexto, diaBrasilia, configCupom, cupomElegivel, montarAvisoCupom, publicoDaLoja, restanteDoDia, LIMITE_DIARIO_PADRAO, MAX_PEDIDOS_PUBLICO };
+module.exports = { ALIAS_EVENTO, EVENTOS_PEDIDO, normalizarEvento, ehEventoDePedido, resolverDestino, chaveEvento, montarAviso, urlDoApp, tokenValido, plataformaValida, tokensExcedentes, decidirReserva, criarLimitador, limparTexto, diaBrasilia, configCupom, cupomElegivel, montarAvisoCupom, publicoDaLoja, configFidelidade, ganhouPresente, avisoPresente, restanteDoDia, LIMITE_DIARIO_PADRAO, MAX_PEDIDOS_PUBLICO };

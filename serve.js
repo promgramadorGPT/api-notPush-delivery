@@ -174,6 +174,21 @@ async function dispararAviso({ caminhoRegistro, destinoUid, porUid, aviso, dados
   }
 }
 
+// V7.2 — Se esta entrega completou a meta da fidelidade, avisa o cliente (sem revelar o presente). 1 vez por pedido; falha aqui nunca derruba o aviso de entrega.
+async function avisarPresente({ pedidoKey, pedido, loja, porUid }) {
+  try {
+    const cfgRaw = loja.fidelidade;
+    if (!cfgRaw || cfgRaw.ativo !== true || !pedido.clienteUid) return null;
+    const snap = await db().ref("pedidos").orderByChild("clienteUid").equalTo(pedido.clienteUid).limitToLast(500).once("value");
+    if (!N.ganhouPresente({ pedidoKey, pedido, pedidosCliente: snap.val() || {}, cfgRaw })) return null;
+    const r = await dispararAviso({
+      caminhoRegistro: `notificaciones_pedidos/${pedidoKey}/presente`, destinoUid: pedido.clienteUid, porUid, aviso: N.avisoPresente({ loja }),
+      dados: { tipo: "presente", evento: "presente", pedidoKey, lojaId: pedido.lojaId, tag: `${pedidoKey}:presente` }
+    });
+    return r.duplicado ? { duplicado: true } : { enviados: r.resultado.enviados, falhas: r.resultado.falhas };
+  } catch (err) { console.error("[NotPush] presente:", err.message); return { erro: true }; }
+}
+
 app.post("/notificar-pedido", autenticar, async (req, res) => {
   try {
     const { pedidoKey } = req.body || {};
@@ -206,7 +221,8 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
       dados: { tipo: evento, evento, pedidoKey, tag: `${pedidoKey}:${chave}` }
     });
     if (r.duplicado) return res.json({ ok: true, pedidoKey, evento, destinoUid: d.destinoUid, duplicado: true });
-    return res.json({ ok: r.resultado.falhas === 0, pedidoKey, evento, destinoUid: d.destinoUid, ...r.resultado });
+    const presente = evento === "entregue" ? await avisarPresente({ pedidoKey, pedido, loja, porUid: uid }) : undefined;
+    return res.json({ ok: r.resultado.falhas === 0, pedidoKey, evento, destinoUid: d.destinoUid, ...r.resultado, ...(presente ? { presente } : {}) });
   } catch (err) { return erroInterno(res, "/notificar-pedido", err); }
 });
 

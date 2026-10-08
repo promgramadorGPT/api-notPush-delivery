@@ -280,6 +280,37 @@ const hash = (t) => crypto.createHash('sha256').update(t).digest('hex');
   console.log('ok 9b aviso automático de cupom (dono, público, 1/dia, teto, chave do Master, sem duplicar)');
 
   // erro interno não vaza detalhes
+  // ---- presente fidelidade (V7.2): aviso quando a entrega completa a meta, sem revelar o prêmio ----
+  {
+    setAt('restaurantes/L9', { ownerUid: 'dono9', nombre: 'Pizzaria Nove', fidelidade: { ativo: true, meta: 3, tipo: 'fixo', valor: 10 } });
+    setAt('restaurantes/L8', { ownerUid: 'dono8', nombre: 'Sem Programa' });
+    await call('POST /registrar-token', { uid: 'cliF', body: { token: tk(40) } });
+    const ped = (lj, st, extra = {}) => ({ lojaId: lj, clienteUid: 'cliF', numeroPedido: 'N' + Math.random().toString(36).slice(2, 6), status: st, subtotal: 40, criadoEm: '2026-10-01T10:00:00.000Z', ...extra });
+    setAt('pedidos/F1', ped('L9', 'Entregado')); setAt('pedidos/F2', ped('L9', 'Entregado'));
+    setAt('pedidos/F3', ped('L9', 'Entregado'));
+    const titulos = () => fcm.enviadas.filter((m) => m.token === tk(40)).map((m) => m.notification.title);
+    const antes = titulos().length;
+    r = await call('POST /notificar-pedido', { uid: 'dono9', body: { pedidoKey: 'F3', evento: 'entregue' } });
+    assert.strictEqual(r.code, 200);
+    const novos = titulos().slice(antes);
+    assert.deepStrictEqual(novos, ['Pedido entregue', 'Você ganhou um presente! 🎁']);
+    const mp = fcm.enviadas.filter((m) => m.token === tk(40)).pop();
+    assert.ok(!/10|desconto|R\$/.test(mp.notification.body), 'não revela o presente: ' + mp.notification.body);
+    assert.match(mp.data.url || mp.data.link || '', /pedidos\.html/);
+    // repetir o mesmo evento não avisa de novo
+    const n1 = titulos().length;
+    await call('POST /notificar-pedido', { uid: 'dono9', body: { pedidoKey: 'F3', evento: 'entregue' } });
+    assert.strictEqual(titulos().length, n1);
+    // 4º pedido não completa a meta (4 de 3 → resta 1 para a próxima)
+    setAt('pedidos/F4', ped('L9', 'Entregado'));
+    await call('POST /notificar-pedido', { uid: 'dono9', body: { pedidoKey: 'F4', evento: 'entregue' } });
+    assert.deepStrictEqual(titulos().slice(n1), ['Pedido entregue']);
+    // loja sem programa: só o aviso normal
+    setAt('pedidos/G1', ped('L8', 'Entregado')); const n2 = titulos().length;
+    await call('POST /notificar-pedido', { uid: 'dono8', body: { pedidoKey: 'G1', evento: 'entregue' } });
+    assert.deepStrictEqual(titulos().slice(n2), ['Pedido entregue']);
+    console.log('ok 9b presente da fidelidade: avisa ao completar a meta, sem revelar, uma vez só');
+  }
   const real = mocks['firebase-admin'].database; mocks['firebase-admin'].database = () => { throw new Error('segredo interno do banco'); };
   r = await call('POST /notificar-pedido', { uid: 'cli', body: { pedidoKey: 'P1', evento: 'novo' } });
   mocks['firebase-admin'].database = real;
@@ -299,4 +330,21 @@ const hash = (t) => crypto.createHash('sha256').update(t).digest('hex');
   assert.strictEqual(N.cupomElegivel({ ...base, fimEm: '2026-06-20' }, dia('2026-06-21')), false);
   assert.strictEqual(N.cupomElegivel(base, dia('2030-01-01')), true);
   console.log('ok cupom: validade');
+}
+
+// ---- fidelidade: regra pura (V7.2) ----
+{
+  const cfgRaw = { ativo: true, meta: 3, tipo: 'fixo', valor: 10 };
+  const mk = (st, extra = {}) => ({ clienteUid: 'u', lojaId: 'L', status: st, subtotal: 40, criadoEm: '2026-10-01T00:00:00Z', ...extra });
+  const novo = mk('En camino');
+  const hist = { A: mk('Entregado'), B: mk('Concluído'), C: mk('Cancelado'), D: mk('Entregado', { clienteUid: 'outro' }), E: mk('Entregado', { lojaId: 'M' }) };
+  assert.strictEqual(N.ganhouPresente({ pedidoKey: 'N', pedido: novo, pedidosCliente: { ...hist, N: novo }, cfgRaw }), true);
+  assert.strictEqual(N.ganhouPresente({ pedidoKey: 'N', pedido: novo, pedidosCliente: { A: hist.A, N: novo }, cfgRaw }), false);
+  assert.strictEqual(N.ganhouPresente({ pedidoKey: 'N', pedido: mk('X', { premioFidelidade: { titulo: 'x' } }), pedidosCliente: hist, cfgRaw }), false);
+  assert.strictEqual(N.ganhouPresente({ pedidoKey: 'N', pedido: novo, pedidosCliente: { ...hist, A: mk('Entregado', { reembolso: { status: 'aprovado' } }) }, cfgRaw }), false);
+  assert.strictEqual(N.ganhouPresente({ pedidoKey: 'N', pedido: novo, pedidosCliente: hist, cfgRaw: { ...cfgRaw, ativo: false } }), false);
+  assert.strictEqual(N.ganhouPresente({ pedidoKey: 'N', pedido: novo, pedidosCliente: hist, cfgRaw: { ...cfgRaw, minimoPedido: 50 } }), false);
+  assert.strictEqual(N.ganhouPresente({ pedidoKey: 'N', pedido: novo, pedidosCliente: hist, cfgRaw: { ...cfgRaw, inicioEm: '2026-10-02T00:00:00Z' } }), false);
+  assert.strictEqual(N.configFidelidade({ ativo: true, meta: 1, tipo: 'fixo', valor: 5 }), null);
+  console.log('ok fidelidade: regra pura do aviso de presente');
 }
