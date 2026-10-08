@@ -96,4 +96,58 @@ function criarLimitador(max, janelaMs, relogio = Date.now) {
   };
 }
 
-module.exports = { ALIAS_EVENTO, EVENTOS_PEDIDO, normalizarEvento, ehEventoDePedido, resolverDestino, chaveEvento, montarAviso, urlDoApp, tokenValido, plataformaValida, tokensExcedentes, decidirReserva, criarLimitador, limparTexto };
+// ---------------- V7.1 — Aviso automático de cupom ----------------
+const LIMITE_DIARIO_PADRAO = 5000; // aparelhos por dia, somando todas as lojas (o Master pode mudar)
+const MAX_PEDIDOS_PUBLICO = 2000;  // quantos pedidos recentes da loja entram na busca do público
+
+/** Dia (YYYY-MM-DD) no horário de Brasília — o limite de "1 por dia" vira à meia-noite daqui. */
+function diaBrasilia(agora = Date.now()) {
+  return new Date(agora - 3 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+/** Configuração do Master (config_plataforma/push_cupom). Sem configuração: ligado, teto padrão. */
+function configCupom(cfg) {
+  const ativo = !(cfg && cfg.ativo === false);
+  const bruto = cfg ? cfg.limiteDiario : undefined;
+  const n = (bruto === undefined || bruto === null || bruto === '') ? NaN : Number(bruto);
+  const limiteDiario = Number.isFinite(n) && n >= 0 ? Math.floor(n) : LIMITE_DIARIO_PADRAO;
+  return { ativo, limiteDiario };
+}
+
+const reais = (v) => `R$ ${Number(v || 0).toFixed(2).replace('.', ',')}`;
+/** Só cupons ativos, com código válido e desconto de verdade. */
+function cupomElegivel(c) {
+  if (!c || c.ativo === false) return false;
+  if (!/^[A-Z0-9_-]{3,20}$/.test(String(c.codigo || ''))) return false;
+  if (c.tipo === 'porcentagem') return Number(c.valor) > 0 && Number(c.valor) <= 100;
+  if (c.tipo === 'fixo') return Number(c.valor) > 0;
+  return c.tipo === 'frete_gratis';
+}
+
+/** Texto fixo (a loja não escreve o texto: ninguém usa o app para mandar propaganda solta). */
+function montarAvisoCupom({ lojaId, loja = {}, cupom = {} }) {
+  const nome = limparTexto(loja.nombre || 'sua loja favorita', 40);
+  const alvo = cupom.tipo === 'porcentagem' ? `${Number(cupom.valor)}% de desconto`
+    : cupom.tipo === 'fixo' ? `${reais(cupom.valor)} de desconto` : 'Entrega grátis';
+  const minimo = Number(cupom.minimo) > 0 ? ` em pedidos a partir de ${reais(cupom.minimo)}` : '';
+  return {
+    titulo: limparTexto(`🎟️ Cupom ${cupom.codigo} — ${nome}`, 100),
+    corpo: limparTexto(`${alvo}${minimo}. Toque para aproveitar.`, 200),
+    caminho: `restaurante.html?id=${encodeURIComponent(lojaId)}`
+  };
+}
+
+/** Clientes distintos que já pediram na loja (pedidos recentes), sem os bloqueados. */
+function publicoDaLoja(pedidosObj, bloqueados = {}) {
+  const uids = new Set();
+  for (const p of Object.values(pedidosObj || {})) {
+    const u = p && p.clienteUid;
+    if (typeof u === 'string' && u && !(bloqueados && bloqueados[u] != null)) uids.add(u);
+  }
+  return [...uids];
+}
+
+/** Quantos aparelhos ainda cabem no teto de hoje. */
+const restanteDoDia = (limite, jaEnviados) => Math.max(0, limite - (Number(jaEnviados) || 0));
+
+module.exports = { ALIAS_EVENTO, EVENTOS_PEDIDO, normalizarEvento, ehEventoDePedido, resolverDestino, chaveEvento, montarAviso, urlDoApp, tokenValido, plataformaValida, tokensExcedentes, decidirReserva, criarLimitador, limparTexto, diaBrasilia, configCupom, cupomElegivel, montarAvisoCupom, publicoDaLoja, restanteDoDia, LIMITE_DIARIO_PADRAO, MAX_PEDIDOS_PUBLICO };
