@@ -277,6 +277,14 @@ const hash = (t) => crypto.createHash('sha256').update(t).digest('hex');
   const dois = await Promise.all([1, 2].map(() => call('POST /notificar-cupom', { uid: 'dono5', body: body('C4') })));
   fcm.atraso = 0;
   assert.strictEqual(fcm.enviadas.length - s0, 2, 'público recebe uma vez só'); assert.ok(dois.some((x) => x.body.motivo));
+  // V7.3.1: aparelho que falha aparece com o motivo (código) na resposta, e o token morto sai da lista
+  setAt('restaurantes/L5/cupones/C5', { codigo: 'FALHA', tipo: 'fixo', valor: 2, ativo: true }); setAt(`notificaciones_cupons_dia/${dia}`, null); setAt(`notificaciones_cupons_total/${dia}`, null);
+  fcm.falhar.add(tk(32));
+  r = await call('POST /notificar-cupom', { uid: 'dono5', body: body('C5') });
+  fcm.falhar.delete(tk(32));
+  assert.deepStrictEqual([r.body.enviados, r.body.falhas, r.body.removidos], [1, 1, 1]);
+  assert.deepStrictEqual(r.body.codigos, { 'messaging/registration-token-not-registered': 1 });
+  assert.match(r.body.mensagem, /1 aparelho\(s\) não receberam/);
   console.log('ok 9b aviso automático de cupom (dono, público, 1/dia, teto, chave do Master, sem duplicar)');
 
   // erro interno não vaza detalhes

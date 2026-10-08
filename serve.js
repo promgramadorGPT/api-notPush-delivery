@@ -6,7 +6,7 @@ const admin = require("firebase-admin");
 const crypto = require("crypto");
 const N = require("./notificacoes");
 
-const VERSAO = "7.3.0";
+const VERSAO = "7.3.1";
 const MAX_TOKENS_POR_USUARIO = 10;
 const app = express();
 
@@ -486,13 +486,17 @@ app.post("/notificar-cupom", autenticar, async (req, res) => {
       await db().ref(`fcm_tokens/${item.uid}/${item.tokenId}`).remove().catch(() => {});
       await db().ref(`fcm_token_owner/${item.tokenId}`).remove().catch(() => {});
     }
-    const resultado = { clientes: clientes.length, tokens: tokens.length, enviados: enviados.length, falhas: falhas.length, cortadoPeloTeto: tokens.length < tokensTodos.length };
+    // V7.3.1: o motivo de cada falha (ex.: messaging/registration-token-not-registered) agora aparece no log e na resposta.
+    const codigos = {};
+    for (const f of falhas) codigos[f.code] = (codigos[f.code] || 0) + 1;
+    const resultado = { clientes: clientes.length, tokens: tokens.length, enviados: enviados.length, falhas: falhas.length, cortadoPeloTeto: tokens.length < tokensTodos.length, ...(falhas.length ? { codigos, removidos: invalidos.length } : {}) };
     const registro = { criadoEm: new Date().toISOString(), porUid: uid, resultado };
     await db().ref(`notificaciones_cupons/${lojaId}/${cupomId}`).set(registro);
     await db().ref(`notificaciones_cupons_dia/${dia}/${lojaId}`).set({ ...registro, cupomId });
     reservaDia = null; reservaCupom = null;
     log("CUPOM RESULTADO:", lojaId, cupomId, JSON.stringify(resultado));
-    return res.json({ ok: true, ...resultado, mensagem: `Aviso enviado para ${resultado.enviados} aparelho(s) de clientes da loja.` });
+    const extra = resultado.falhas ? ` ${resultado.falhas} aparelho(s) não receberam${resultado.removidos ? " (notificação desativada ou aparelho antigo: já saiu da lista)" : ""}.` : "";
+    return res.json({ ok: true, ...resultado, mensagem: `Aviso enviado para ${resultado.enviados} aparelho(s) de clientes da loja.${extra}` });
   } catch (err) {
     await liberar();
     return erroInterno(res, "/notificar-cupom", err);

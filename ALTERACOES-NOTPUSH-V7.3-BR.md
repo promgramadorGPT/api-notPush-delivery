@@ -14,3 +14,7 @@ O endereço usado é o e-mail da conta Google do lojista (com o do cadastro como
 ## Outras mudanças
 - `VERSAO` em `serve.js` estava em 7.1.0 mesmo na V7.2; agora diz **7.3.0** (e `/health` mostra isso).
 - Testes: `tests/cadastro.test.cjs` (junto com o `notpush.test.cjs` em `npm test`).
+
+## V7.3.1
+- `/notificar-cupom`: quando algum aparelho falha, a resposta e o log `CUPOM RESULTADO` trazem `codigos` (ex.: `messaging/registration-token-not-registered`) e `removidos` (tokens mortos já apagados). A mensagem para a loja avisa quantos aparelhos não receberam.
+- Teste novo cobrindo a falha de um aparelho.
