@@ -18,3 +18,9 @@ O endereço usado é o e-mail da conta Google do lojista (com o do cadastro como
 ## V7.3.1
 - `/notificar-cupom`: quando algum aparelho falha, a resposta e o log `CUPOM RESULTADO` trazem `codigos` (ex.: `messaging/registration-token-not-registered`) e `removidos` (tokens mortos já apagados). A mensagem para a loja avisa quantos aparelhos não receberam.
 - Teste novo cobrindo a falha de um aparelho.
+
+## V7.3.2
+- **Erro falso ao enviar cupom (corrigido).** Na 7.3.1 o código de erro do aparelho (`messaging/registration-token-not-registered`) era gravado como chave do Firebase, e a `/` é proibida em chave. A gravação do registro falhava **depois** do envio: a loja via erro mesmo com a notificação entregue, e a reserva do dia era liberada (risco de aviso duplicado). Agora: as chaves são saneadas (`/` → `_`); se mesmo assim a gravação falhar, grava um registro mínimo e responde `ok:true`; e, depois que o envio começa, a reserva **não** é mais liberada por falha de gravação.
+- **`/notificar-master`**: se salvar o histórico falhar, a resposta continua `ok:true` (a notificação já saiu) e o erro vai para o log.
+- **Quadradinho branco no ícone.** O `badge` (ícone pequeno da barra de status do Android) usava o logo opaco, que o Android pinta de branco. Agora usa `icons/badge-96.png` (branco com fundo transparente), enviado em pedidos, cupons e Master (o Master agora também envia `icon`). Requer `APP_URL=https://yapoodbr.vercel.app` no Render e o front V75.52 publicado.
+- Testes: banco falso agora rejeita chaves inválidas como o Firebase real; casos novos (chave com `/`, falha ao gravar registro).

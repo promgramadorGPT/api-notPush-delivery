@@ -6,7 +6,7 @@ const admin = require("firebase-admin");
 const crypto = require("crypto");
 const N = require("./notificacoes");
 
-const VERSAO = "7.3.1";
+const VERSAO = "7.3.2";
 const MAX_TOKENS_POR_USUARIO = 10;
 const app = express();
 
@@ -121,7 +121,7 @@ function montarMensagem(token, aviso, dados) {
     data: { ...Object.fromEntries(Object.entries(dados).map(([k, v]) => [k, String(v)])), url, link: url },
     webpush: {
       headers: { Urgency: "high", TTL: "3600" },
-      notification: { ...(icone ? { icon: icone, badge: icone } : {}), tag }, // mesma tag evita aviso em dobro (SDK + service worker)
+      notification: { ...(icone ? { icon: icone, badge: N.urlDoApp(process.env.APP_URL, "icons/badge-96.png") } : {}), tag }, // mesma tag evita aviso em dobro (SDK + service worker)
       ...(https ? { fcmOptions: { link: url } } : {})
     }
   };
@@ -270,6 +270,8 @@ app.post("/notificar-master", autenticar, async (req, res) => {
 
     const baseLink = link ? (link.startsWith("/") ? N.urlDoApp(process.env.APP_URL || "", link) : link) : N.urlDoApp(process.env.APP_URL || "", "index.html");
     const https = baseLink.startsWith("https://");
+    const iconeMaster = https && process.env.APP_URL ? N.urlDoApp(process.env.APP_URL, "icons/icons-192.png") : undefined;
+    const badgeMaster = iconeMaster ? N.urlDoApp(process.env.APP_URL, "icons/badge-96.png") : undefined;
     if (!tokens.length) return res.json({ ok: true, campanhaId: campanha, enviados: 0, falhas: 0, tokens: 0, semToken: true });
 
     const enviados = [], falhas = [], invalidos = [];
@@ -279,7 +281,7 @@ app.post("/notificar-master", autenticar, async (req, res) => {
         token: item.token,
         notification: { title: titulo, body: corpo },
         data: { tipo: "master", campanhaId: campanha, url: baseLink, link: baseLink, tag: `master:${campanha}` },
-        webpush: { notification: { tag: `master:${campanha}` }, ...(https ? { fcmOptions: { link: baseLink } } : {}) }
+        webpush: { notification: { ...(iconeMaster ? { icon: iconeMaster, badge: badgeMaster } : {}), tag: `master:${campanha}` }, ...(https ? { fcmOptions: { link: baseLink } } : {}) }
       }));
       try {
         const response = await comTimeout(admin.messaging().sendEach(messages), 30000, "Envio FCM Master");
@@ -300,7 +302,7 @@ app.post("/notificar-master", autenticar, async (req, res) => {
       await db().ref(`fcm_token_owner/${item.tokenId}`).remove().catch(() => {});
     }
     const resultado = { enviados: enviados.length, falhas: falhas.length, tokens: tokens.length, semToken: false, messageIds: enviados.slice(0, 20), erros: falhas.slice(0, 50) };
-    await db().ref(`notificaciones_master/${campanha}`).set({ criadoEm: new Date().toISOString(), porUid: req.user.uid, titulo, corpo, link: baseLink, resultado });
+    try { await db().ref(`notificaciones_master/${campanha}`).set({ criadoEm: new Date().toISOString(), porUid: req.user.uid, titulo, corpo, link: baseLink, resultado }); } catch (e) { console.error("[NotPush] Master: enviada, mas o registro não foi gravado:", e.message); }
     log("MASTER RESULTADO:", JSON.stringify({ ...resultado, messageIds: undefined, erros: undefined }));
     return res.json({ ok: falhas.length === 0, campanhaId: campanha, ...resultado });
   } catch (err) { return erroInterno(res, "/notificar-master", err); }
@@ -391,7 +393,7 @@ app.post("/notificar-cadastro", autenticar, async (req, res) => {
 // A loja cadastra um cupom e o NotPush avisa, no máximo 1 vez por dia por loja, os clientes que já pediram nela.
 // Tudo é conferido aqui no servidor: dono da loja, cupom ativo, loja não suspensa, chave e teto do Master.
 app.post("/notificar-cupom", autenticar, async (req, res) => {
-  let reservaDia = null, reservaCupom = null;
+  let reservaDia = null, reservaCupom = null, jaEnviou = false;
   const liberar = async () => {
     if (reservaDia) await db().ref(reservaDia).remove().catch(() => {});
     if (reservaCupom) await db().ref(reservaCupom).remove().catch(() => {});
@@ -460,13 +462,14 @@ app.post("/notificar-cupom", autenticar, async (req, res) => {
     const icone = https ? N.urlDoApp(process.env.APP_URL, "icons/icons-192.png") : undefined;
     const tag = `cupom:${lojaId}:${cupomId}`;
     const enviados = [], falhas = [], invalidos = [];
+    jaEnviou = true; // a partir daqui as notificações já podem ter saído: não liberar a reserva se algo falhar depois
     for (let inicio = 0; inicio < tokens.length; inicio += 500) {
       const lote = tokens.slice(inicio, inicio + 500);
       const messages = lote.map(item => ({
         token: item.token,
         notification: { title: aviso.titulo, body: aviso.corpo },
         data: { tipo: "cupom", lojaId, cupomId, url: baseLink, link: baseLink, tag },
-        webpush: { notification: { ...(icone ? { icon: icone, badge: icone } : {}), tag }, ...(https ? { fcmOptions: { link: baseLink } } : {}) }
+        webpush: { notification: { ...(icone ? { icon: icone, badge: N.urlDoApp(process.env.APP_URL, "icons/badge-96.png") } : {}), tag }, ...(https ? { fcmOptions: { link: baseLink } } : {}) }
       }));
       try {
         const response = await comTimeout(admin.messaging().sendEach(messages), 30000, "Envio FCM Cupom");
@@ -490,15 +493,26 @@ app.post("/notificar-cupom", autenticar, async (req, res) => {
     const codigos = {};
     for (const f of falhas) codigos[f.code] = (codigos[f.code] || 0) + 1;
     const resultado = { clientes: clientes.length, tokens: tokens.length, enviados: enviados.length, falhas: falhas.length, cortadoPeloTeto: tokens.length < tokensTodos.length, ...(falhas.length ? { codigos, removidos: invalidos.length } : {}) };
-    const registro = { criadoEm: new Date().toISOString(), porUid: uid, resultado };
-    await db().ref(`notificaciones_cupons/${lojaId}/${cupomId}`).set(registro);
-    await db().ref(`notificaciones_cupons_dia/${dia}/${lojaId}`).set({ ...registro, cupomId });
+    // V7.3.2: o Firebase não aceita "/" "." "$" "#" "[" "]" em chaves; o código do FCM (messaging/...) tem "/". No banco os códigos vão com "_".
+    const codigosSeguros = Object.fromEntries(Object.entries(resultado.codigos || {}).map(([k, v]) => [k.replace(/[.#$\[\]\/]/g, "_"), v]));
+    const resultadoBanco = { ...resultado, ...(resultado.codigos ? { codigos: codigosSeguros } : {}) };
+    const registro = { criadoEm: new Date().toISOString(), porUid: uid, resultado: resultadoBanco };
+    // O registro é só controle (1 aviso por dia/cupom). Se gravar falhar, o aviso JÁ foi enviado: não pode virar erro nem liberar a reserva.
+    try {
+      await db().ref(`notificaciones_cupons/${lojaId}/${cupomId}`).set(registro);
+      await db().ref(`notificaciones_cupons_dia/${dia}/${lojaId}`).set({ ...registro, cupomId });
+    } catch (errRegistro) {
+      console.error("[NotPush] Cupom: aviso enviado, mas o registro não foi gravado:", errRegistro.message);
+      const minimo = { criadoEm: registro.criadoEm, porUid: uid, resultado: { enviados: resultado.enviados, falhas: resultado.falhas } };
+      await db().ref(`notificaciones_cupons/${lojaId}/${cupomId}`).set(minimo).catch(() => {});
+      await db().ref(`notificaciones_cupons_dia/${dia}/${lojaId}`).set({ ...minimo, cupomId }).catch(() => {});
+    }
     reservaDia = null; reservaCupom = null;
     log("CUPOM RESULTADO:", lojaId, cupomId, JSON.stringify(resultado));
     const extra = resultado.falhas ? ` ${resultado.falhas} aparelho(s) não receberam${resultado.removidos ? " (notificação desativada ou aparelho antigo: já saiu da lista)" : ""}.` : "";
     return res.json({ ok: true, ...resultado, mensagem: `Aviso enviado para ${resultado.enviados} aparelho(s) de clientes da loja.${extra}` });
   } catch (err) {
-    await liberar();
+    if (!jaEnviou) await liberar();
     return erroInterno(res, "/notificar-cupom", err);
   }
 });
