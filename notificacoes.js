@@ -223,4 +223,34 @@ function emailCadastro(cad = {}, appUrl = '') {
 /** Quantos aparelhos ainda cabem no teto de hoje. */
 const restanteDoDia = (limite, jaEnviados) => Math.max(0, limite - (Number(jaEnviados) || 0));
 
-module.exports = { ALIAS_EVENTO, EVENTOS_PEDIDO, normalizarEvento, ehEventoDePedido, resolverDestino, chaveEvento, montarAviso, urlDoApp, tokenValido, plataformaValida, tokensExcedentes, decidirReserva, criarLimitador, limparTexto, diaBrasilia, configCupom, cupomElegivel, montarAvisoCupom, publicoDaLoja, configFidelidade, ganhouPresente, avisoPresente, restanteDoDia, chaveCadastro, avisoCadastro, emailCadastro, LIMITE_DIARIO_PADRAO, MAX_PEDIDOS_PUBLICO };
+// ---------------- V7.3.5: ícones por data (campanhas) e silhueta da barra por app ----------------
+const APPS_ICONE = ['cliente', 'painel', 'entregador', 'master'];
+const ICONE_PADRAO = { cliente: 'icons/icons-192.png', painel: 'icons/adm-192.png', entregador: 'icons/entregador-192.png', master: 'icons/master-192.png' };
+// Ícone pequeno da barra de status: só silhueta de uma cor. O entregador usa a moto, o Master a coroa, os demais os olhos e o sorriso.
+const BADGE_DO_APP = { cliente: 'icons/badge-96.png', painel: 'icons/badge-96.png', entregador: 'icons/badge-entregador-96.png', master: 'icons/badge-master-96.png' };
+const HOST_ICONE = /^https:\/\/res\.cloudinary\.com\/[A-Za-z0-9_.\-\/%~]+$/;
+
+/** Qual app recebe o aviso, pelo caminho que ele abre. */
+function appDoCaminho(caminho) {
+  const c = String(caminho || '').replace(/^\/+/, '');
+  if (/^admin-loja\.html(?:[?#]|$)/.test(c)) return 'painel';
+  if (/^entregador\.html(?:[?#]|$)/.test(c)) return 'entregador';
+  if (/^master\.html(?:[?#]|$)/.test(c)) return 'master';
+  return 'cliente';
+}
+/** Data (AAAA-MM-DD) no horário de Brasília. */
+const hojeBrasilia = (agoraMs = Date.now()) => new Date(agoraMs - 3 * 3600000).toISOString().slice(0, 10);
+const dataIsoValida = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(v + 'T00:00:00Z')) && new Date(v + 'T00:00:00Z').toISOString().slice(0, 10) === v;
+
+/** URL do ícone da campanha em vigor para o app (ou ''). Só aceita imagem do Cloudinary em https e datas válidas (de/até inclusivos). */
+function iconeDeCampanha(config, app, agoraMs = Date.now()) {
+  const c = config && typeof config === 'object' ? config[app] : null;
+  if (!c || typeof c !== 'object') return '';
+  const url = String(c.url || '');
+  if (!HOST_ICONE.test(url) || url.length > 300) return '';
+  if (!dataIsoValida(c.de) || !dataIsoValida(c.ate) || c.de > c.ate) return '';
+  const hoje = hojeBrasilia(agoraMs);
+  return hoje >= c.de && hoje <= c.ate ? url : '';
+}
+
+module.exports = { APPS_ICONE, ICONE_PADRAO, BADGE_DO_APP, appDoCaminho, hojeBrasilia, iconeDeCampanha, ALIAS_EVENTO, EVENTOS_PEDIDO, normalizarEvento, ehEventoDePedido, resolverDestino, chaveEvento, montarAviso, urlDoApp, tokenValido, plataformaValida, tokensExcedentes, decidirReserva, criarLimitador, limparTexto, diaBrasilia, configCupom, cupomElegivel, montarAvisoCupom, publicoDaLoja, configFidelidade, ganhouPresente, avisoPresente, restanteDoDia, chaveCadastro, avisoCadastro, emailCadastro, LIMITE_DIARIO_PADRAO, MAX_PEDIDOS_PUBLICO };

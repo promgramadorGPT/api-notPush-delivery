@@ -1,6 +1,6 @@
 {
   "name": "notpush-delivery",
-  "version": "7.3.2",
+  "version": "7.3.5",
   "private": true,
   "main": "serve.js",
   "scripts": {

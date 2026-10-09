@@ -24,3 +24,16 @@ O endereço usado é o e-mail da conta Google do lojista (com o do cadastro como
 - **`/notificar-master`**: se salvar o histórico falhar, a resposta continua `ok:true` (a notificação já saiu) e o erro vai para o log.
 - **Quadradinho branco no ícone.** O `badge` (ícone pequeno da barra de status do Android) usava o logo opaco, que o Android pinta de branco. Agora usa `icons/badge-96.png` (branco com fundo transparente), enviado em pedidos, cupons e Master (o Master agora também envia `icon`). Requer `APP_URL=https://yapoodbr.vercel.app` no Render e o front V75.52 publicado.
 - Testes: banco falso agora rejeita chaves inválidas como o Firebase real; casos novos (chave com `/`, falha ao gravar registro).
+
+## V7.3.4 — Master como app próprio
+- `APP_URL_MASTER` (opcional): endereço do app Master. Sem ela, os avisos para o Master abrem em `APP_URL`, como antes.
+- O aviso "Novo cadastro de lojista" usa o ícone do Master (`icons/master-192.png`).
+- Sem outras mudanças: o aviso continua sendo enviado a todos os aparelhos dos Masters, uma vez por cadastro enviado (reenvio depois de recusa conta como novo envio).
+
+## V7.3.5 — ícones por data e silhueta própria na barra
+
+- Cada aviso usa o ícone colorido do **app de destino** (cliente, painel, entregador, Master) e uma **silhueta branca** própria na barra de status: moto para o entregador, coroa para o Master, olhos e sorriso para cliente e painel. (Alguns fabricantes de Android ignoram a silhueta e mostram o ícone do app; isso não dá para forçar.)
+- Lê `config_icones/{app}` do Firebase (cache de 60 s). Se hoje (horário de Brasília) está entre `de` e `ate`, o aviso usa a imagem da data; fora do período volta sozinho ao padrão. Só aceita `https://res.cloudinary.com/…`.
+- O aviso de "novo cadastro" para os Masters agora usa o ícone do Master.
+- As silhuetas ficam em `icons/badge-entregador-96.png` e `icons/badge-master-96.png` **no site (front)**, não aqui.
+- Nada a configurar no Render. Só publicar o front antes, para as silhuetas existirem.

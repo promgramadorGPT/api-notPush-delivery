@@ -70,9 +70,14 @@ const tree = {};
 const seg = (p) => p.split('/').filter(Boolean);
 const getAt = (p) => seg(p).reduce((o, k) => (o == null ? undefined : o[k]), tree);
 const setAt = (p, v) => { const s = seg(p); let o = tree; s.slice(0, -1).forEach((k) => { if (typeof o[k] !== 'object' || o[k] === null) o[k] = {}; o = o[k]; }); if (v === null || v === undefined) delete o[s[s.length - 1]]; else o[s[s.length - 1]] = JSON.parse(JSON.stringify(v)); };
+// O Realtime Database recusa chaves com . $ # [ ] / e valores undefined: o fake agora recusa também (um bug real de V7.3.1 passou despercebido por isso).
+const chavesValidas = (v, caminho = '') => {
+  if (v === undefined) throw new Error('valor undefined em ' + caminho);
+  if (v && typeof v === 'object') for (const [k, x] of Object.entries(v)) { if (/[.$#\[\]\/]/.test(k)) throw new Error('chave inválida no Firebase: ' + k); chavesValidas(x, caminho + '/' + k); }
+};
 const mkRef = (p) => ({
   once: async () => { const v = getAt(p); const c = v === undefined ? null : JSON.parse(JSON.stringify(v)); return { val: () => c, exists: () => c !== null }; },
-  set: async (v) => setAt(p, v),
+  set: async (v) => { chavesValidas(v); return setAt(p, v); },
   remove: async () => setAt(p, null),
   orderByChild: (k) => ({ equalTo: (v) => ({ limitToLast: () => ({ once: async () => { const todos = getAt(p) || {}; const f = Object.fromEntries(Object.entries(todos).filter(([, x]) => x && x[k] === v)); return { val: () => (Object.keys(f).length ? f : null) }; } }) }) }),
   transaction: async (fn) => { const cur = getAt(p); const r = fn(cur === undefined ? null : JSON.parse(JSON.stringify(cur))); if (r === undefined) return { committed: false }; setAt(p, r); return { committed: true }; }
@@ -285,6 +290,17 @@ const hash = (t) => crypto.createHash('sha256').update(t).digest('hex');
   assert.deepStrictEqual([r.body.enviados, r.body.falhas, r.body.removidos], [1, 1, 1]);
   assert.deepStrictEqual(r.body.codigos, { 'messaging/registration-token-not-registered': 1 });
   assert.match(r.body.mensagem, /1 aparelho\(s\) não receberam/);
+  assert.strictEqual(r.body.ok, true, 'falha de aparelho não pode virar erro depois do envio');
+  assert.deepStrictEqual(getAt('notificaciones_cupons/L5/C5/resultado/codigos'), { 'messaging_registration-token-not-registered': 1 }, 'no banco o código vai sem "/"');
+  // V7.3.2: se gravar o registro falhar, o aviso já saiu: resposta continua ok e a reserva NÃO é liberada (não reenvia em dobro)
+  setAt('restaurantes/L5/cupones/C6', { codigo: 'REGFALHA', tipo: 'fixo', valor: 2, ativo: true }); setAt(`notificaciones_cupons_dia/${dia}`, null); setAt(`notificaciones_cupons_total/${dia}`, null);
+  const refOriginal = mocks['firebase-admin'].database().ref;
+  const antesEnvio = fcm.enviadas.length;
+  mocks['firebase-admin'].database = () => ({ ref: (p) => { const r0 = refOriginal(p); return p.startsWith('notificaciones_cupons/L5/C6') || p.startsWith('notificaciones_cupons_dia/') ? { ...r0, set: async (v) => { if (v && v.resultado) throw new Error('falha simulada ao gravar'); return r0.set(v); } } : r0; } });
+  const rr = await call('POST /notificar-cupom', { uid: 'dono5', body: body('C6') });
+  mocks['firebase-admin'].database = () => ({ ref: refOriginal });
+  assert.strictEqual(rr.body.ok, true); assert.ok(fcm.enviadas.length > antesEnvio, 'o aviso saiu');
+  assert.ok(getAt('notificaciones_cupons/L5/C6'), 'reserva mantida (não vira reenvio em dobro)');
   console.log('ok 9b aviso automático de cupom (dono, público, 1/dia, teto, chave do Master, sem duplicar)');
 
   // erro interno não vaza detalhes
@@ -324,6 +340,69 @@ const hash = (t) => crypto.createHash('sha256').update(t).digest('hex');
   mocks['firebase-admin'].database = real;
   assert.strictEqual(r.code, 500); assert.ok(!/segredo/.test(JSON.stringify(r.body)));
   console.log('ok 10 erro interno sem vazar detalhes');
+  // V7.3.3: painel e entregador podem ter endereço próprio (apps separados no Android); o cliente continua em APP_URL
+  {
+    const { montarMensagem } = require('../serve.js');
+    const msg = (caminho) => montarMensagem('t'.repeat(30), { titulo: 'x', corpo: 'y', caminho, icone: 'icons/adm-192.png' }, { tag: 'a' });
+    assert.strictEqual(msg('admin-loja.html').data.url, 'https://app.exemplo.com.br/admin-loja.html', 'sem variável própria usa APP_URL');
+    process.env.APP_URL_PAINEL = 'https://painel.exemplo.com.br';
+    process.env.APP_URL_ENTREGADOR = 'https://entrega.exemplo.com.br/';
+    const a = msg('admin-loja.html');
+    assert.strictEqual(a.data.url, 'https://painel.exemplo.com.br/admin-loja.html');
+    assert.strictEqual(a.webpush.fcmOptions.link, 'https://painel.exemplo.com.br/admin-loja.html');
+    assert.strictEqual(a.webpush.notification.icon, 'https://painel.exemplo.com.br/icons/adm-192.png');
+    assert.strictEqual(a.webpush.notification.badge, 'https://painel.exemplo.com.br/icons/badge-96.png');
+    assert.strictEqual(msg('entregador.html').data.url, 'https://entrega.exemplo.com.br/entregador.html');
+    assert.strictEqual(msg('pedidos.html').data.url, 'https://app.exemplo.com.br/pedidos.html', 'cliente continua em APP_URL');
+    assert.strictEqual(msg('restaurante.html?id=L1').data.url, 'https://app.exemplo.com.br/restaurante.html?id=L1');
+    assert.strictEqual(msg('master.html#cadastros').data.url, 'https://app.exemplo.com.br/master.html#cadastros', 'Master sem variável própria usa APP_URL');
+    process.env.APP_URL_MASTER = 'https://master.exemplo.com.br';
+    assert.strictEqual(msg('master.html#cadastros').data.url, 'https://master.exemplo.com.br/master.html#cadastros');
+    delete process.env.APP_URL_PAINEL; delete process.env.APP_URL_ENTREGADOR; delete process.env.APP_URL_MASTER;
+    console.log('ok endereços próprios do painel, do entregador e do Master');
+  }
+
+  // ---- ícones por data e silhueta da barra (V7.3.5) ----
+  {
+    const { montarMensagem } = require('../serve.js');
+    const hoje = Date.parse('2026-10-12T15:00:00Z'); // 12h em Brasília
+    const url = 'https://res.cloudinary.com/dkbhdasfh/image/upload/v1/criancas.png';
+    assert.strictEqual(N.appDoCaminho('entregador.html'), 'entregador');
+    assert.strictEqual(N.appDoCaminho('admin-loja.html#pedidos'), 'painel');
+    assert.strictEqual(N.appDoCaminho('master.html#cadastros'), 'master');
+    assert.strictEqual(N.appDoCaminho('pedidos.html'), 'cliente');
+    assert.strictEqual(N.hojeBrasilia(Date.parse('2026-10-12T02:00:00Z')), '2026-10-11', 'madrugada UTC ainda é o dia anterior em Brasília');
+    const cfg = { cliente: { url, de: '2026-10-10', ate: '2026-10-13' } };
+    assert.strictEqual(N.iconeDeCampanha(cfg, 'cliente', hoje), url, 'dentro do período');
+    assert.strictEqual(N.iconeDeCampanha(cfg, 'cliente', Date.parse('2026-10-14T15:00:00Z')), '', 'depois do fim volta ao padrão');
+    assert.strictEqual(N.iconeDeCampanha(cfg, 'cliente', Date.parse('2026-10-09T15:00:00Z')), '', 'antes do início ainda é o padrão');
+    assert.strictEqual(N.iconeDeCampanha(cfg, 'painel', hoje), '', 'outro app não é afetado');
+    assert.strictEqual(N.iconeDeCampanha({ cliente: { url: 'https://evil.example/x.png', de: '2026-10-10', ate: '2026-10-13' } }, 'cliente', hoje), '', 'só aceita Cloudinary');
+    assert.strictEqual(N.iconeDeCampanha({ cliente: { url: 'http://res.cloudinary.com/x.png', de: '2026-10-10', ate: '2026-10-13' } }, 'cliente', hoje), '', 'só https');
+    assert.strictEqual(N.iconeDeCampanha({ cliente: { url, de: '2026-10-13', ate: '2026-10-10' } }, 'cliente', hoje), '', 'datas invertidas');
+    assert.strictEqual(N.iconeDeCampanha({ cliente: { url, de: '2026-13-40', ate: '2026-10-13' } }, 'cliente', hoje), '', 'data inválida');
+    assert.strictEqual(N.iconeDeCampanha(null, 'cliente', hoje), '');
+    // silhueta própria por app
+    const md = (caminho) => montarMensagem('t'.repeat(30), { titulo: 'x', corpo: 'y', caminho }, { tag: 'a' });
+    assert.match(md('entregador.html').webpush.notification.badge, /badge-entregador-96\.png$/);
+    assert.match(md('master.html#cadastros').webpush.notification.badge, /badge-master-96\.png$/);
+    assert.match(md('pedidos.html').webpush.notification.badge, /badge-96\.png$/);
+    assert.match(md('entregador.html').webpush.notification.icon, /entregador-192\.png$/);
+    // fim a fim: o NotPush lê config_icones (cache de 60 s) e usa a imagem da data
+    setAt('config_icones/painel', { url, de: '2000-01-01', ate: '2099-12-31', rotulo: 'Teste' });
+    const realNow = Date.now; Date.now = () => realNow() + 120000;
+    try {
+      await call('POST /registrar-token', { uid: 'dono', body: { token: tk(2) } });
+      setAt('pedidos/PI1', { lojaId: 'L1', clienteUid: 'cli', numeroPedido: 'ZZ99ZZ', status: 'Pendiente', bairro: 'Centro', tipoEntrega: 'delivery' });
+      fcm.enviadas.length = 0;
+      await call('POST /notificar-pedido', { uid: 'cli', body: { pedidoKey: 'PI1', evento: 'novo' } });
+      const m = fcm.enviadas.find((x) => x.token === tk(2));
+      assert.ok(m, 'o dono recebeu o aviso');
+      assert.strictEqual(m.webpush.notification.icon, url, 'o aviso do painel usa o ícone da campanha');
+    } finally { Date.now = realNow; }
+    setAt('config_icones', null);
+    console.log('ok ícones por data e silhueta da barra por app');
+  }
   console.log('TODOS OS TESTES DO NOTPUSH PASSARAM');
   process.exit(0);
 })().catch((e) => { console.error(e); process.exit(1); });

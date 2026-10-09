@@ -6,7 +6,7 @@ const admin = require("firebase-admin");
 const crypto = require("crypto");
 const N = require("./notificacoes");
 
-const VERSAO = "7.3.2";
+const VERSAO = "7.3.5";
 const MAX_TOKENS_POR_USUARIO = 10;
 const app = express();
 
@@ -110,10 +110,31 @@ app.post("/remover-token", autenticar, async (req, res) => {
 });
 
 // ---------------- Envio ----------------
+// V7.3.3/7.3.4: o painel da loja, o app do entregador e o Master podem ter endereço próprio (APP_URL_PAINEL / APP_URL_ENTREGADOR / APP_URL_MASTER),
+// para o Android tratá-los como apps separados do app do cliente. Sem essas variáveis tudo usa APP_URL (como antes).
+function baseDoApp(caminho) {
+  const c = String(caminho || "").replace(/^\/+/, "");
+  if (/^admin-loja\.html(?:[?#]|$)/.test(c) && process.env.APP_URL_PAINEL) return process.env.APP_URL_PAINEL;
+  if (/^entregador\.html(?:[?#]|$)/.test(c) && process.env.APP_URL_ENTREGADOR) return process.env.APP_URL_ENTREGADOR;
+  if (/^master\.html(?:[?#]|$)/.test(c) && process.env.APP_URL_MASTER) return process.env.APP_URL_MASTER;
+  return process.env.APP_URL || "";
+}
+
+// V7.3.5: ícones por data. O Master grava em config_icones/{app} (url + de/até); aqui lemos com cache curto.
+let iconesCfg = null, iconesEm = 0;
+async function carregarIcones() {
+  if (iconesCfg !== null && Date.now() - iconesEm < 60000) return iconesCfg;
+  try { iconesCfg = (await lerValor("config_icones")) || {}; iconesEm = Date.now(); }
+  catch (err) { console.error("[NotPush] config_icones:", err.message); if (iconesCfg === null) iconesCfg = {}; iconesEm = Date.now() - 30000; }
+  return iconesCfg;
+}
 function montarMensagem(token, aviso, dados) {
-  const url = N.urlDoApp(process.env.APP_URL || "", aviso.caminho);
+  const base = baseDoApp(aviso.caminho);
+  const url = N.urlDoApp(base, aviso.caminho);
   const https = url.startsWith("https://");
-  const icone = https ? N.urlDoApp(process.env.APP_URL, aviso.icone || "icons/icons-192.png") : undefined;
+  const app = N.appDoCaminho(aviso.caminho);
+  const campanha = https ? N.iconeDeCampanha(iconesCfg, app) : "";
+  const icone = https ? (campanha || N.urlDoApp(base, aviso.icone || N.ICONE_PADRAO[app])) : undefined;
   const tag = dados.tag;
   return {
     token,
@@ -121,7 +142,7 @@ function montarMensagem(token, aviso, dados) {
     data: { ...Object.fromEntries(Object.entries(dados).map(([k, v]) => [k, String(v)])), url, link: url },
     webpush: {
       headers: { Urgency: "high", TTL: "3600" },
-      notification: { ...(icone ? { icon: icone, badge: N.urlDoApp(process.env.APP_URL, "icons/badge-96.png") } : {}), tag }, // mesma tag evita aviso em dobro (SDK + service worker)
+      notification: { ...(icone ? { icon: icone, badge: N.urlDoApp(base, N.BADGE_DO_APP[app]) } : {}), tag }, // mesma tag evita aviso em dobro (SDK + service worker)
       ...(https ? { fcmOptions: { link: url } } : {})
     }
   };
@@ -130,6 +151,7 @@ function montarMensagem(token, aviso, dados) {
 /** Envia aos aparelhos do destino, limpa tokens mortos e devolve o resultado. */
 async function enviarParaUsuario(destinoUid, aviso, dados) {
   const tokensObj = (await lerValor(`fcm_tokens/${destinoUid}`)) || {};
+  await carregarIcones();
   const itens = Object.entries(tokensObj).filter(([, v]) => v?.token).map(([id, v]) => ({ id, token: v.token }));
   if (!itens.length) return { enviados: 0, falhas: 0, tokens: 0, semToken: true };
   const enviados = [], falhas = [], invalidos = [];
@@ -270,7 +292,8 @@ app.post("/notificar-master", autenticar, async (req, res) => {
 
     const baseLink = link ? (link.startsWith("/") ? N.urlDoApp(process.env.APP_URL || "", link) : link) : N.urlDoApp(process.env.APP_URL || "", "index.html");
     const https = baseLink.startsWith("https://");
-    const iconeMaster = https && process.env.APP_URL ? N.urlDoApp(process.env.APP_URL, "icons/icons-192.png") : undefined;
+    await carregarIcones();
+    const iconeMaster = https && process.env.APP_URL ? (N.iconeDeCampanha(iconesCfg, "cliente") || N.urlDoApp(process.env.APP_URL, "icons/icons-192.png")) : undefined;
     const badgeMaster = iconeMaster ? N.urlDoApp(process.env.APP_URL, "icons/badge-96.png") : undefined;
     if (!tokens.length) return res.json({ ok: true, campanhaId: campanha, enviados: 0, falhas: 0, tokens: 0, semToken: true });
 
@@ -377,7 +400,7 @@ app.post("/notificar-cadastro", autenticar, async (req, res) => {
       if (await reservarUnico(`${base}_email`)) {
         let para = "";
         try { para = (await admin.auth().getUser(alvo)).email || ""; } catch { /* usa o e-mail do cadastro */ }
-        const t = N.emailCadastro(cad, process.env.APP_URL || "");
+        const t = N.emailCadastro(cad, baseDoApp("admin-loja.html"));
         email = await enviarEmail({ para: para || cad.email || "", assunto: t.assunto, texto: t.texto });
         if (!email.enviado) await db().ref(`${base}_email`).remove().catch(() => {});   // libera nova tentativa se não saiu
       }
@@ -459,7 +482,8 @@ app.post("/notificar-cupom", autenticar, async (req, res) => {
     const aviso = N.montarAvisoCupom({ lojaId, loja, cupom });
     const baseLink = N.urlDoApp(process.env.APP_URL || "", aviso.caminho);
     const https = baseLink.startsWith("https://");
-    const icone = https ? N.urlDoApp(process.env.APP_URL, "icons/icons-192.png") : undefined;
+    await carregarIcones();
+    const icone = https ? (N.iconeDeCampanha(iconesCfg, "cliente") || N.urlDoApp(process.env.APP_URL, "icons/icons-192.png")) : undefined;
     const tag = `cupom:${lojaId}:${cupomId}`;
     const enviados = [], falhas = [], invalidos = [];
     jaEnviou = true; // a partir daqui as notificações já podem ter saído: não liberar a reserva se algo falhar depois
