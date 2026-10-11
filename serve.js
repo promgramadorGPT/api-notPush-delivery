@@ -6,7 +6,7 @@ const admin = require("firebase-admin");
 const crypto = require("crypto");
 const N = require("./notificacoes");
 
-const VERSAO = "7.3.5";
+const VERSAO = "7.3.8";
 const MAX_TOKENS_POR_USUARIO = 10;
 const app = express();
 
@@ -136,13 +136,15 @@ function montarMensagem(token, aviso, dados) {
   const campanha = https ? N.iconeDeCampanha(iconesCfg, app) : "";
   const icone = https ? (campanha || N.urlDoApp(base, aviso.icone || N.ICONE_PADRAO[app])) : undefined;
   const tag = dados.tag;
+  const badge = icone ? N.urlDoApp(base, N.BADGE_DO_APP[app]) : undefined;
   return {
     token,
     notification: { title: aviso.titulo, body: aviso.corpo },
-    data: { ...Object.fromEntries(Object.entries(dados).map(([k, v]) => [k, String(v)])), url, link: url },
+    // icon/badge também vão em `data`: o service worker do app troca o aviso (mesma tag) e, sem isso, voltava ao ícone padrão.
+    data: { ...Object.fromEntries(Object.entries(dados).map(([k, v]) => [k, String(v)])), url, link: url, ...(icone ? { icon: icone, badge } : {}) },
     webpush: {
       headers: { Urgency: "high", TTL: "3600" },
-      notification: { ...(icone ? { icon: icone, badge: N.urlDoApp(base, N.BADGE_DO_APP[app]) } : {}), tag }, // mesma tag evita aviso em dobro (SDK + service worker)
+      notification: { ...(icone ? { icon: icone, badge } : {}), tag }, // mesma tag evita aviso em dobro (SDK + service worker)
       ...(https ? { fcmOptions: { link: url } } : {})
     }
   };
@@ -233,7 +235,7 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
     const entregador = (evento === "atribuido" && entrega?.entregadorUid) ? await lerValor(`entregadores/${entrega.entregadorUid}`) : null;
 
     const d = N.resolverDestino(evento, { uid, pedido, loja, entrega, entregador });
-    if (d.erro) return res.status(d.status).json({ ok: false, error: d.erro });
+    if (d.erro) { log("Pedido:", pedidoKey, "evento:", evento, "NÃO enviado:", d.erro); return res.status(d.status).json({ ok: false, error: d.erro }); }
     if (!d.destinoUid) return res.status(400).json({ ok: false, error: "Destino da notificação não encontrado." });
 
     const chave = N.chaveEvento(evento, d.destinoUid);
@@ -242,7 +244,7 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
       caminhoRegistro: `notificaciones_pedidos/${pedidoKey}/${chave}`, destinoUid: d.destinoUid, porUid: uid, aviso,
       dados: { tipo: evento, evento, pedidoKey, tag: `${pedidoKey}:${chave}` }
     });
-    if (r.duplicado) return res.json({ ok: true, pedidoKey, evento, destinoUid: d.destinoUid, duplicado: true });
+    if (r.duplicado) { log("Pedido:", pedidoKey, "evento:", evento, "NÃO enviado: este aviso já foi enviado antes para", d.destinoUid); return res.json({ ok: true, pedidoKey, evento, destinoUid: d.destinoUid, duplicado: true }); }
     const presente = evento === "entregue" ? await avisarPresente({ pedidoKey, pedido, loja, porUid: uid }) : undefined;
     return res.json({ ok: r.resultado.falhas === 0, pedidoKey, evento, destinoUid: d.destinoUid, ...r.resultado, ...(presente ? { presente } : {}) });
   } catch (err) { return erroInterno(res, "/notificar-pedido", err); }
@@ -278,6 +280,8 @@ app.post("/notificar-master", autenticar, async (req, res) => {
     const link = String(req.body?.link || "").trim();
     if (link && !/^https:\/\/[^\s]+$/.test(link) && !/^\/[^\s]*$/.test(link)) return res.status(400).json({ ok: false, error: "Link inválido (use https:// ou um caminho como /index.html)." });
     const campanha = idSeguro(req.body?.campanhaId) ? req.body.campanhaId : `master-${Date.now()}`;
+    // Mesmo texto e link = mesma tag: reenviar a mesma promoção substitui o aviso que ainda está na tela em vez de empilhar outro.
+    const tagMaster = `master:${crypto.createHash("sha1").update([titulo, corpo, link].join("\n")).digest("hex").slice(0, 16)}`;
 
     if ((await lerValor(`admins/${req.user.uid}/role`)) !== "master") return res.status(403).json({ ok: false, error: "Usuário não é Master." });
 
@@ -303,8 +307,8 @@ app.post("/notificar-master", autenticar, async (req, res) => {
       const messages = lote.map(item => ({
         token: item.token,
         notification: { title: titulo, body: corpo },
-        data: { tipo: "master", campanhaId: campanha, url: baseLink, link: baseLink, tag: `master:${campanha}` },
-        webpush: { notification: { ...(iconeMaster ? { icon: iconeMaster, badge: badgeMaster } : {}), tag: `master:${campanha}` }, ...(https ? { fcmOptions: { link: baseLink } } : {}) }
+        data: { tipo: "master", campanhaId: campanha, url: baseLink, link: baseLink, tag: tagMaster, ...(iconeMaster ? { icon: iconeMaster, badge: badgeMaster } : {}) },
+        webpush: { notification: { ...(iconeMaster ? { icon: iconeMaster, badge: badgeMaster } : {}), tag: tagMaster }, ...(https ? { fcmOptions: { link: baseLink } } : {}) }
       }));
       try {
         const response = await comTimeout(admin.messaging().sendEach(messages), 30000, "Envio FCM Master");
@@ -492,7 +496,7 @@ app.post("/notificar-cupom", autenticar, async (req, res) => {
       const messages = lote.map(item => ({
         token: item.token,
         notification: { title: aviso.titulo, body: aviso.corpo },
-        data: { tipo: "cupom", lojaId, cupomId, url: baseLink, link: baseLink, tag },
+        data: { tipo: "cupom", lojaId, cupomId, url: baseLink, link: baseLink, tag, ...(icone ? { icon: icone, badge: N.urlDoApp(process.env.APP_URL, "icons/badge-96.png") } : {}) },
         webpush: { notification: { ...(icone ? { icon: icone, badge: N.urlDoApp(process.env.APP_URL, "icons/badge-96.png") } : {}), tag }, ...(https ? { fcmOptions: { link: baseLink } } : {}) }
       }));
       try {
