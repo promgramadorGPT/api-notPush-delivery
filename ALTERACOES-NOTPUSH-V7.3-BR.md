@@ -37,3 +37,15 @@ O endereço usado é o e-mail da conta Google do lojista (com o do cadastro como
 - O aviso de "novo cadastro" para os Masters agora usa o ícone do Master.
 - As silhuetas ficam em `icons/badge-entregador-96.png` e `icons/badge-master-96.png` **no site (front)**, não aqui.
 - Nada a configurar no Render. Só publicar o front antes, para as silhuetas existirem.
+
+## V7.3.6 — ícone e silhueta também em `data`
+
+O service worker do app substitui o aviso que o navegador mostra (mesma tag) e só lê `data`; sem o ícone e a silhueta ali, voltava ao padrão (olhos e sorriso). Agora `icon` e `badge` vão em `data` em todos os envios (pedido, cadastro, campanha do Master, cupom). Exige o front V75.69.
+
+## V7.3.7 — reenviar a mesma promoção não empilha
+
+Cada envio do Master tinha uma tag própria (pelo número da campanha), então reenviar o mesmo texto criava outro aviso. Agora a tag vem do conteúdo (título + mensagem + link): texto igual substitui o aviso que ainda está na tela; texto diferente continua sendo aviso separado. O histórico do Master não muda. Só o NotPush muda (o front não precisa de alteração).
+
+## V7.3.8 — o log diz por que um aviso de pedido não saiu
+
+Antes, quando o aviso não saía por já ter sido enviado, ou por o entregador estar inativo ou de outra loja, o log mostrava só "Pedido: … evento: …" e nada depois. Agora aparece uma linha "NÃO enviado: motivo". Quando sai, continua a linha "RESULTADO: … {enviados, falhas, tokens, semToken}". Nenhuma regra de envio mudou.

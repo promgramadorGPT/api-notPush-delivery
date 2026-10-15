@@ -6,7 +6,7 @@ const admin = require("firebase-admin");
 const crypto = require("crypto");
 const N = require("./notificacoes");
 
-const VERSAO = "7.3.8";
+const VERSAO = "7.4.0";
 const MAX_TOKENS_POR_USUARIO = 10;
 const app = express();
 
@@ -44,6 +44,7 @@ try {
 
 const db = () => admin.database();
 const limite = N.criarLimitador(40, 60000); // por usuário, por minuto
+const limiteInterno = N.criarLimitador(600, 60000); // V7.4: chamadas da API (todas as entregas juntas)
 
 async function autenticar(req, res, next) {
   try {
@@ -137,14 +138,23 @@ function montarMensagem(token, aviso, dados) {
   const icone = https ? (campanha || N.urlDoApp(base, aviso.icone || N.ICONE_PADRAO[app])) : undefined;
   const tag = dados.tag;
   const badge = icone ? N.urlDoApp(base, N.BADGE_DO_APP[app]) : undefined;
+  // V7.4: aviso de etapa do pedido — imagem da etapa (Android), botões e "renotify" (toca de novo ao trocar a mesma notificação)
+  const imagem = https && aviso.imagem ? N.urlDoApp(base, aviso.imagem) : undefined;
+  const acoes = Array.isArray(aviso.acoes) ? aviso.acoes.slice(0, 2) : [];
+  const etapa = aviso.etapa ? {
+    ...(imagem ? { image: imagem } : {}),
+    ...(acoes.length ? { actions: acoes.map((a) => ({ action: a.acao, title: a.titulo })) } : {}),
+    renotify: true, vibrate: [200, 100, 200]
+  } : {};
+  const dadosEtapa = aviso.etapa ? { etapa: String(aviso.etapa), ...(imagem ? { imagem } : {}), ...(acoes.length ? { acoes: JSON.stringify(acoes.map((a) => ({ acao: a.acao, titulo: a.titulo }))) } : {}) } : {};
   return {
     token,
-    notification: { title: aviso.titulo, body: aviso.corpo },
+    notification: { title: aviso.titulo, body: aviso.corpo, ...(imagem ? { imageUrl: imagem } : {}) },
     // icon/badge também vão em `data`: o service worker do app troca o aviso (mesma tag) e, sem isso, voltava ao ícone padrão.
-    data: { ...Object.fromEntries(Object.entries(dados).map(([k, v]) => [k, String(v)])), url, link: url, ...(icone ? { icon: icone, badge } : {}) },
+    data: { ...Object.fromEntries(Object.entries(dados).map(([k, v]) => [k, String(v)])), url, link: url, ...(icone ? { icon: icone, badge } : {}), ...dadosEtapa },
     webpush: {
       headers: { Urgency: "high", TTL: "3600" },
-      notification: { ...(icone ? { icon: icone, badge } : {}), tag }, // mesma tag evita aviso em dobro (SDK + service worker)
+      notification: { ...(icone ? { icon: icone, badge } : {}), tag, ...etapa }, // mesma tag evita aviso em dobro (SDK + service worker)
       ...(https ? { fcmOptions: { link: url } } : {})
     }
   };
@@ -231,23 +241,57 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
     const loja = await lerValor(`restaurantes/${pedido.lojaId}`);
     if (!loja || !loja.ownerUid) return res.status(404).json({ ok: false, error: "Loja do pedido não encontrada ou sem ownerUid." });
 
-    const entrega = (evento === "entregue" || evento === "atribuido") ? await lerValor(`entregas/${pedidoKey}`) : null;
-    const entregador = (evento === "atribuido" && entrega?.entregadorUid) ? await lerValor(`entregadores/${entrega.entregadorUid}`) : null;
+    const entrega = (evento === "entregue" || evento === "atribuido" || evento === "despachado") ? await lerValor(`entregas/${pedidoKey}`) : null;
+    const entregador = ((evento === "atribuido" || evento === "despachado") && entrega?.entregadorUid) ? await lerValor(`entregadores/${entrega.entregadorUid}`) : null;
+    const rastreio = evento === "despachado" ? await lerValor(`rastreio/${pedidoKey}`) : null;
 
     const d = N.resolverDestino(evento, { uid, pedido, loja, entrega, entregador });
     if (d.erro) { log("Pedido:", pedidoKey, "evento:", evento, "NÃO enviado:", d.erro); return res.status(d.status).json({ ok: false, error: d.erro }); }
     if (!d.destinoUid) return res.status(400).json({ ok: false, error: "Destino da notificação não encontrado." });
 
     const chave = N.chaveEvento(evento, d.destinoUid);
-    const aviso = N.montarAviso(evento, { pedido });
+    const aviso = N.montarAviso(evento, { pedido, loja, quemLeva: N.quemLevaDe({ rastreio, entregador }) });
+    // V7.4: avisos de etapa do cliente usam a mesma tag do pedido (o novo substitui o anterior)
+    const tag = N.ehAvisoDeEtapa(evento) ? N.tagDoPedido(pedidoKey) : `${pedidoKey}:${chave}`;
     const r = await dispararAviso({
       caminhoRegistro: `notificaciones_pedidos/${pedidoKey}/${chave}`, destinoUid: d.destinoUid, porUid: uid, aviso,
-      dados: { tipo: evento, evento, pedidoKey, tag: `${pedidoKey}:${chave}` }
+      dados: { tipo: evento, evento, pedidoKey, tag }
     });
     if (r.duplicado) { log("Pedido:", pedidoKey, "evento:", evento, "NÃO enviado: este aviso já foi enviado antes para", d.destinoUid); return res.json({ ok: true, pedidoKey, evento, destinoUid: d.destinoUid, duplicado: true }); }
     const presente = evento === "entregue" ? await avisarPresente({ pedidoKey, pedido, loja, porUid: uid }) : undefined;
     return res.json({ ok: r.resultado.falhas === 0, pedidoKey, evento, destinoUid: d.destinoUid, ...r.resultado, ...(presente ? { presente } : {}) });
   } catch (err) { return erroInterno(res, "/notificar-pedido", err); }
+});
+
+// V7.4 — "O entregador está chegando!" (≤ 150 m). Chamada só pela API (servidor a servidor), com a chave interna
+// NOTPUSH_CHAVE_INTERNA (a mesma nas variáveis do Render da API). Confere no banco o pedido e a distância do rastreio; uma vez por pedido.
+const chaveInterna = () => String(process.env.NOTPUSH_CHAVE_INTERNA || "").trim();
+function chaveInternaOk(recebida) {
+  const certa = chaveInterna();
+  if (certa.length < 16 || typeof recebida !== "string") return false;
+  const a = crypto.createHash("sha256").update(recebida).digest(), b = crypto.createHash("sha256").update(certa).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+app.post("/notificar-chegando", async (req, res) => {
+  try {
+    if (!chaveInternaOk(req.headers["x-notpush-chave"])) return res.status(401).json({ ok: false, error: "Não autorizado." });
+    if (!limiteInterno("chegando")) return res.status(429).json({ ok: false, error: "Muitas chamadas. Aguarde um minuto." });
+    const { pedidoKey } = req.body || {};
+    if (!idSeguro(pedidoKey)) return res.status(400).json({ ok: false, error: "pedidoKey ausente ou inválido." });
+    const [pedido, rastreio] = await Promise.all([lerValor(`pedidos/${pedidoKey}`), lerValor(`rastreio/${pedidoKey}`)]);
+    if (!pedido) return res.status(404).json({ ok: false, error: "Pedido não encontrado." });
+    const v = N.chegandoValido({ pedido, rastreio });
+    if (!v.ok) { log("Chegando:", pedidoKey, "NÃO enviado:", v.motivo); return res.status(409).json({ ok: false, error: "Ainda não está chegando.", motivo: v.motivo }); }
+    const loja = (await lerValor(`restaurantes/${pedido.lojaId}`)) || {};
+    const aviso = N.montarAviso("chegando", { pedido, loja, quemLeva: N.quemLevaDe({ rastreio }) });
+    const r = await dispararAviso({
+      caminhoRegistro: `notificaciones_pedidos/${pedidoKey}/chegando`, destinoUid: pedido.clienteUid, porUid: "api", aviso,
+      dados: { tipo: "chegando", evento: "chegando", pedidoKey, tag: N.tagDoPedido(pedidoKey) }
+    });
+    if (r.duplicado) return res.json({ ok: true, pedidoKey, evento: "chegando", duplicado: true });
+    log("Chegando:", pedidoKey, JSON.stringify({ enviados: r.resultado.enviados, falhas: r.resultado.falhas }));
+    return res.json({ ok: r.resultado.falhas === 0, pedidoKey, evento: "chegando", enviados: r.resultado.enviados, falhas: r.resultado.falhas, semToken: r.resultado.semToken });
+  } catch (err) { return erroInterno(res, "/notificar-chegando", err); }
 });
 
 // Cliente pediu em bairro que a loja ainda não conhece → avisa o dono. Chamada pelo próprio cliente que criou a sugestão.

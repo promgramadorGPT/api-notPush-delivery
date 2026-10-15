@@ -44,15 +44,64 @@ const chaveEvento = (evento, destinoUid) => (evento === 'atribuido' ? `atribuido
 
 const limparTexto = (v, max) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
 
-/** Título, corpo e caminho (relativo ao app) de cada aviso. */
-function montarAviso(evento, { pedido = {}, nomeBairro = '' } = {}) {
+// ---------- V7.4: notificação do pedido por etapa (uma só por pedido, trocada a cada etapa) ----------
+// Etapas da barra: 1 Recebido · 2 Preparando · 3 A caminho · 4 Chegando · 5 Entregue. "Recebido" não manda push.
+const ETAPA_DO_EVENTO = { aceptado: 2, despachado: 3, chegando: 4, entregue: 5 };
+const IMAGEM_DA_ETAPA = { 2: 'icons/status/2-preparando.png', 3: 'icons/status/3-a-caminho.png', 4: 'icons/status/4-chegando.png', 5: 'icons/status/5-entregue.png' };
+const CHEGANDO_M = 150;
+const ehAvisoDeEtapa = (evento) => Object.prototype.hasOwnProperty.call(ETAPA_DO_EVENTO, evento);
+/** Mesma tag para todos os avisos de etapa do pedido: o novo substitui o anterior na bandeja. */
+const tagDoPedido = (pedidoKey) => `pedido-${pedidoKey}`;
+
+/** "30-40" → "30–40 min"; "45" → "45 min"; texto livre curto fica como está. */
+function textoTempo(v) {
+  const t = limparTexto(v, 30);
+  if (!t) return '';
+  const m = /^(\d{1,3})\s*(?:-|–|a|até)\s*(\d{1,3})(?:\s*min\w*)?$/i.exec(t);
+  if (m) return `${m[1]}–${m[2]} min`;
+  if (/^\d{1,3}(?:\s*min\w*)?$/i.test(t)) return `${parseInt(t, 10)} min`;
+  return t;
+}
+
+/** Quem leva (para o texto): { nome, tipo: 'loja' | 'parceiro' } ou null. Só o primeiro nome. */
+function quemLevaDe({ rastreio, entregador } = {}) {
+  const nome = limparTexto((rastreio && rastreio.entregador && rastreio.entregador.nome) || (entregador && entregador.nome) || '', 40).split(' ')[0];
+  if (!nome) return null;
+  return { nome, tipo: rastreio && rastreio.parceiro ? 'parceiro' : 'loja' };
+}
+
+/** O aviso "chegando" vale agora? Pedido de delivery ainda não entregue/cancelado e rastreio recente com distância ≤ 150 m. */
+function chegandoValido({ pedido, rastreio, agora = Date.now() } = {}) {
+  if (!pedido || !pedido.clienteUid) return { ok: false, motivo: 'pedido' };
+  if (pedido.tipoEntrega && pedido.tipoEntrega !== 'delivery') return { ok: false, motivo: 'retirada' };
+  if (/entreg|cancel|rechaz|recus/i.test(String(pedido.status || ''))) return { ok: false, motivo: 'encerrado' };
+  const d = rastreio && typeof rastreio.distanciaM === 'number' ? rastreio.distanciaM : null;
+  if (d === null || !(d >= 0) || d > CHEGANDO_M) return { ok: false, motivo: 'longe' };
+  const em = Number(rastreio.atualizadoEm);
+  if (!Number.isFinite(em) || agora - em > 3 * 60000) return { ok: false, motivo: 'rastreio-antigo' };
+  return { ok: true };
+}
+
+/** Título, corpo e caminho (relativo ao app) de cada aviso. Avisos de etapa trazem também etapa, imagem e botões. */
+function montarAviso(evento, { pedido = {}, nomeBairro = '', loja = {}, quemLeva = null } = {}) {
   const num = pedido.numeroPedido ? ` #${limparTexto(pedido.numeroPedido, 20)}` : '';
   const q = pedido.numeroPedido ? `status.html?num=${encodeURIComponent(pedido.numeroPedido)}` : 'pedidos.html';
+  const etapa = ETAPA_DO_EVENTO[evento];
+  const comEtapa = (aviso, acoes) => ({ ...aviso, etapa, imagem: IMAGEM_DA_ETAPA[etapa], acoes });
+  const nomeLoja = limparTexto(loja.nombre || loja.nome || '', 40);
+  const quem = quemLeva && quemLeva.nome ? `${quemLeva.nome} (${quemLeva.tipo === 'parceiro' ? 'parceiro YaPOOD' : 'entregador da loja'})` : '';
   switch (evento) {
     case 'novo': return { titulo: 'Novo pedido', corpo: `Você recebeu um novo pedido${num}.`, caminho: 'admin-loja.html', icone: 'icons/adm-192.png' };
-    case 'aceptado': return { titulo: 'Pedido aceito', corpo: 'Seu pedido foi aceito pela loja.', caminho: q };
-    case 'despachado': return { titulo: 'Pedido saiu para entrega', corpo: 'Seu pedido saiu para entrega.', caminho: q };
-    case 'entregue': return { titulo: 'Pedido entregue', corpo: 'Bom apetite! Quando puder, avalie o seu pedido.', caminho: q };
+    case 'aceptado': {
+      const tempo = textoTempo(loja.tiempoEntrega || loja.tempoEntrega);
+      const partes = [nomeLoja, tempo ? `chega em ${tempo}` : '', num.trim()].filter(Boolean);
+      return comEtapa({ titulo: '🍳 Pedido sendo preparado', corpo: partes.join(' · ') || 'A loja aceitou e já está preparando o seu pedido.', caminho: q }, [{ acao: 'ver', titulo: 'Ver pedido' }]);
+    }
+    case 'despachado':
+      return comEtapa({ titulo: '🛵 Saiu para entrega', corpo: `${quem ? `${quem} está a caminho` : 'Seu pedido está a caminho'}${num ? ` ·${num}` : ''}`, caminho: q }, [{ acao: 'mapa', titulo: 'Ver no mapa' }]);
+    case 'chegando':
+      return comEtapa({ titulo: '📍 O entregador está chegando!', corpo: `${quemLeva && quemLeva.nome ? quemLeva.nome : 'O entregador'} está a menos de ${CHEGANDO_M} m. Prepare-se para receber.`, caminho: q }, [{ acao: 'mapa', titulo: 'Ver no mapa' }]);
+    case 'entregue': return comEtapa({ titulo: '✅ Pedido entregue', corpo: 'Bom apetite! Toque para avaliar o pedido.', caminho: q }, [{ acao: 'avaliar', titulo: 'Avaliar' }]);
     case 'atribuido': return { titulo: `Nova entrega${num}`, corpo: pedido.bairro ? `Bairro: ${limparTexto(pedido.bairro, 60)}. Abra o app para ver o endereço.` : 'Abra o app para ver o endereço.', caminho: 'entregador.html', icone: 'icons/entregador-192.png' };
     case 'bairro': return { titulo: 'Bairro novo', corpo: `Um cliente pediu em ${limparTexto(nomeBairro, 60)}. Defina a taxa para esse bairro.`, caminho: 'admin-loja.html', icone: 'icons/adm-192.png' };
     default: return null;
@@ -253,4 +302,4 @@ function iconeDeCampanha(config, app, agoraMs = Date.now()) {
   return hoje >= c.de && hoje <= c.ate ? url : '';
 }
 
-module.exports = { APPS_ICONE, ICONE_PADRAO, BADGE_DO_APP, appDoCaminho, hojeBrasilia, iconeDeCampanha, ALIAS_EVENTO, EVENTOS_PEDIDO, normalizarEvento, ehEventoDePedido, resolverDestino, chaveEvento, montarAviso, urlDoApp, tokenValido, plataformaValida, tokensExcedentes, decidirReserva, criarLimitador, limparTexto, diaBrasilia, configCupom, cupomElegivel, montarAvisoCupom, publicoDaLoja, configFidelidade, ganhouPresente, avisoPresente, restanteDoDia, chaveCadastro, avisoCadastro, emailCadastro, LIMITE_DIARIO_PADRAO, MAX_PEDIDOS_PUBLICO };
+module.exports = { ETAPA_DO_EVENTO, IMAGEM_DA_ETAPA, CHEGANDO_M, ehAvisoDeEtapa, tagDoPedido, textoTempo, quemLevaDe, chegandoValido, APPS_ICONE, ICONE_PADRAO, BADGE_DO_APP, appDoCaminho, hojeBrasilia, iconeDeCampanha, ALIAS_EVENTO, EVENTOS_PEDIDO, normalizarEvento, ehEventoDePedido, resolverDestino, chaveEvento, montarAviso, urlDoApp, tokenValido, plataformaValida, tokensExcedentes, decidirReserva, criarLimitador, limparTexto, diaBrasilia, configCupom, cupomElegivel, montarAvisoCupom, publicoDaLoja, configFidelidade, ganhouPresente, avisoPresente, restanteDoDia, chaveCadastro, avisoCadastro, emailCadastro, LIMITE_DIARIO_PADRAO, MAX_PEDIDOS_PUBLICO };
