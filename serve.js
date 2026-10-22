@@ -6,7 +6,7 @@ const admin = require("firebase-admin");
 const crypto = require("crypto");
 const N = require("./notificacoes");
 
-const VERSAO = "7.4.0";
+const VERSAO = "7.5.0";
 const MAX_TOKENS_POR_USUARIO = 10;
 const app = express();
 
@@ -145,7 +145,7 @@ function montarMensagem(token, aviso, dados) {
     ...(imagem ? { image: imagem } : {}),
     ...(acoes.length ? { actions: acoes.map((a) => ({ action: a.acao, title: a.titulo })) } : {}),
     renotify: true, vibrate: [200, 100, 200]
-  } : {};
+  } : aviso.renotify ? { renotify: true, vibrate: [120, 80, 120] } : {}; // V7.5: conversa do pedido — a mensagem nova substitui a anterior e toca de novo
   const dadosEtapa = aviso.etapa ? { etapa: String(aviso.etapa), ...(imagem ? { imagem } : {}), ...(acoes.length ? { acoes: JSON.stringify(acoes.map((a) => ({ acao: a.acao, titulo: a.titulo }))) } : {}) } : {};
   return {
     token,
@@ -261,6 +261,39 @@ app.post("/notificar-pedido", autenticar, async (req, res) => {
     const presente = evento === "entregue" ? await avisarPresente({ pedidoKey, pedido, loja, porUid: uid }) : undefined;
     return res.json({ ok: r.resultado.falhas === 0, pedidoKey, evento, destinoUid: d.destinoUid, ...r.resultado, ...(presente ? { presente } : {}) });
   } catch (err) { return erroInterno(res, "/notificar-pedido", err); }
+});
+
+// V7.5 — Mensagem na conversa do pedido. Quem enviou chama logo depois de gravar a mensagem; aqui conferimos no banco
+// (a mensagem existe, é dessa pessoa, é recente e ainda não foi lida) e avisamos o OUTRO lado, no máximo 1 vez a cada 2 min por conversa.
+app.post("/notificar-chat", autenticar, async (req, res) => {
+  try {
+    const { pedidoKey, mensagemId } = req.body || {};
+    const uid = req.user.uid;
+    if (!limite("chat:" + uid)) return res.status(429).json({ ok: false, error: "Muitas tentativas. Aguarde um minuto." });
+    if (!idSeguro(pedidoKey) || !idSeguro(mensagemId)) return res.status(400).json({ ok: false, error: "pedidoKey ou mensagemId inválido." });
+    const pedido = await lerValor(`pedidos/${pedidoKey}`);
+    const loja = pedido ? await lerValor(`restaurantes/${pedido.lojaId}`) : null;
+    const d = N.destinoChat({ uid, pedido, loja });
+    if (d.erro) return res.status(d.status).json({ ok: false, error: d.erro });
+    const chat = await lerValor(`chat_pedidos/${pedidoKey}`);
+    const caminho = `notificaciones_chat/${pedidoKey}/${d.destinoLado}`;
+    const antes = await lerValor(caminho);
+    const agora = Date.now();
+    const dec = N.decidirAvisoChat({ chat, mensagemId, uid, lado: d.lado, destinoLado: d.destinoLado, ultimoAviso: antes && antes.ultimoEm, agora });
+    if (!dec.ok) return res.status(dec.status).json({ ok: dec.status === 200, enviado: false, motivo: dec.motivo });
+    // reserva o intervalo (duas chamadas juntas não mandam dois avisos)
+    let pulou = false;
+    const t = await db().ref(caminho).transaction((atual) => {
+      if (atual && agora - Number(atual.ultimoEm || 0) < N.CHAT_INTERVALO_MS) { pulou = true; return undefined; }
+      return { ultimoEm: agora };
+    });
+    if (pulou || !t.committed) return res.json({ ok: true, enviado: false, motivo: "intervalo" });
+    const aviso = N.avisoChat({ destinoLado: d.destinoLado, pedidoKey, pedido, loja, texto: dec.texto, novas: dec.novas });
+    const resultado = await enviarParaUsuario(d.destinoUid, aviso, { tipo: "chat", evento: "chat", pedidoKey, tag: N.tagDoChat(pedidoKey) });
+    await db().ref(caminho).set({ ultimoEm: agora, porUid: uid, mensagemId, resultado: { enviados: resultado.enviados, falhas: resultado.falhas, tokens: resultado.tokens } });
+    log("Chat:", pedidoKey, "para", d.destinoLado, JSON.stringify({ enviados: resultado.enviados, falhas: resultado.falhas, novas: dec.novas }));
+    return res.json({ ok: resultado.falhas === 0, enviado: resultado.enviados > 0, destino: d.destinoLado, ...resultado, messageIds: undefined, erros: undefined });
+  } catch (err) { return erroInterno(res, "/notificar-chat", err); }
 });
 
 // V7.4 — "O entregador está chegando!" (≤ 150 m). Chamada só pela API (servidor a servidor), com a chave interna

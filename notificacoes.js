@@ -302,4 +302,60 @@ function iconeDeCampanha(config, app, agoraMs = Date.now()) {
   return hoje >= c.de && hoje <= c.ate ? url : '';
 }
 
-module.exports = { ETAPA_DO_EVENTO, IMAGEM_DA_ETAPA, CHEGANDO_M, ehAvisoDeEtapa, tagDoPedido, textoTempo, quemLevaDe, chegandoValido, APPS_ICONE, ICONE_PADRAO, BADGE_DO_APP, appDoCaminho, hojeBrasilia, iconeDeCampanha, ALIAS_EVENTO, EVENTOS_PEDIDO, normalizarEvento, ehEventoDePedido, resolverDestino, chaveEvento, montarAviso, urlDoApp, tokenValido, plataformaValida, tokensExcedentes, decidirReserva, criarLimitador, limparTexto, diaBrasilia, configCupom, cupomElegivel, montarAvisoCupom, publicoDaLoja, configFidelidade, ganhouPresente, avisoPresente, restanteDoDia, chaveCadastro, avisoCadastro, emailCadastro, LIMITE_DIARIO_PADRAO, MAX_PEDIDOS_PUBLICO };
+// ---------- V7.5 — aviso de mensagem na conversa do pedido (cliente ↔ loja) ----------
+const CHAT_INTERVALO_MS = 2 * 60000;   // no máximo 1 aviso a cada 2 min por conversa e por destino
+const CHAT_MSG_RECENTE_MS = 10 * 60000; // só avisa mensagem recente (evita reenviar coisa antiga)
+const CHAT_PREVIA = 90;
+// Mesmas regras do site (js/chat-util.js): telefones, e-mails, @perfis e links saem escondidos também no aviso.
+const RE_EMAIL = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g;
+const RE_LINK = /\b(?:https?:\/\/|www\.)\S+|\b[\w-]+(?:\.[\w-]+)*\.(?:com|br|net|org|me|ly|io|app|link|site|online|store|shop|gl|to|bio)\b(?:\/\S*)?/gi;
+const RE_PERFIL = /(^|[\s(])@[\w.]{3,}/g;
+const RE_TEL = /(?:\+?\d[\s().\-]*){7,}\d/g;
+function esconderContato(texto) {
+  return String(texto == null ? '' : texto)
+    .replace(RE_EMAIL, '[contato escondido]')
+    .replace(RE_LINK, '[link escondido]')
+    .replace(RE_PERFIL, (_m, a) => `${a}[contato escondido]`)
+    .replace(RE_TEL, (m) => (m.replace(/\D/g, '').length >= 8 ? '[número escondido]' : m));
+}
+/** Prévia do texto para o aviso: sem contato, numa linha, até 90 caracteres. */
+function previaChat(texto) {
+  const t = esconderContato(texto).replace(/\s+/g, ' ').trim();
+  return t.length > CHAT_PREVIA ? t.slice(0, CHAT_PREVIA - 1).trimEnd() + '…' : t;
+}
+/** Quem está escrevendo e para quem vai o aviso. { lado, destinoUid, destinoLado } ou { erro, status }. */
+function destinoChat({ uid, pedido, loja }) {
+  if (!pedido || !loja) return { erro: 'Pedido não encontrado.', status: 404 };
+  if (uid && uid === pedido.clienteUid) return loja.ownerUid ? { lado: 'cliente', destinoLado: 'loja', destinoUid: loja.ownerUid } : { erro: 'Loja sem dono.', status: 404 };
+  if (uid && uid === loja.ownerUid) return pedido.clienteUid ? { lado: 'loja', destinoLado: 'cliente', destinoUid: pedido.clienteUid } : { erro: 'Pedido sem cliente.', status: 404 };
+  return { erro: 'Você não participa desta conversa.', status: 403 };
+}
+/** Confere a mensagem e decide se avisa. { ok, novas } ou { ok:false, motivo, status }. */
+function decidirAvisoChat({ chat, mensagemId, uid, lado, destinoLado, ultimoAviso, agora = Date.now() }) {
+  const m = chat && chat.msgs && chat.msgs[mensagemId];
+  if (!m || m.uid !== uid || m.de !== lado || typeof m.texto !== 'string') return { ok: false, motivo: 'mensagem', status: 404 };
+  const em = Number(m.em) || 0;
+  if (!em || agora - em > CHAT_MSG_RECENTE_MS) return { ok: false, motivo: 'antiga', status: 409 };
+  const lido = Number(chat.lido && chat.lido[destinoLado]) || 0;
+  if (lido >= em) return { ok: false, motivo: 'lida', status: 200 };
+  if (ultimoAviso && agora - Number(ultimoAviso) < CHAT_INTERVALO_MS) return { ok: false, motivo: 'intervalo', status: 200 };
+  const novas = Object.values(chat.msgs || {}).filter((x) => x && x.de === lado && (Number(x.em) || 0) > lido).length || 1;
+  return { ok: true, novas, texto: m.texto };
+}
+const primeiroNome = (n) => String(n || '').trim().split(/\s+/)[0] || 'Cliente';
+/** Texto do aviso. Cliente: abre o pedido com a conversa; loja: abre o painel na conversa. */
+function avisoChat({ destinoLado, pedidoKey, pedido = {}, loja = {}, texto = '', novas = 1 }) {
+  const num = pedido.numeroPedido || pedidoKey;
+  const previa = previaChat(texto);
+  const mais = novas > 1 ? `${novas} mensagens novas · ` : '';
+  if (destinoLado === 'cliente') {
+    return { titulo: `💬 ${loja.nombre || loja.nome || 'A loja'} te mandou uma mensagem`, corpo: `Pedido #${num}: ${mais}${previa}`,
+      caminho: `status.html?num=${encodeURIComponent(num)}&chat=1`, renotify: true };
+  }
+  const nome = primeiroNome(pedido.cliente && (pedido.cliente.nombre || pedido.cliente.nome));
+  return { titulo: `💬 Mensagem do cliente · Pedido #${num}`, corpo: `${nome}: ${mais}${previa}`,
+    caminho: `admin-loja.html?chat=${encodeURIComponent(pedidoKey)}`, renotify: true };
+}
+const tagDoChat = (pedidoKey) => `chat-${pedidoKey}`;
+
+module.exports = { CHAT_INTERVALO_MS, CHAT_MSG_RECENTE_MS, esconderContato, previaChat, destinoChat, decidirAvisoChat, avisoChat, tagDoChat, ETAPA_DO_EVENTO, IMAGEM_DA_ETAPA, CHEGANDO_M, ehAvisoDeEtapa, tagDoPedido, textoTempo, quemLevaDe, chegandoValido, APPS_ICONE, ICONE_PADRAO, BADGE_DO_APP, appDoCaminho, hojeBrasilia, iconeDeCampanha, ALIAS_EVENTO, EVENTOS_PEDIDO, normalizarEvento, ehEventoDePedido, resolverDestino, chaveEvento, montarAviso, urlDoApp, tokenValido, plataformaValida, tokensExcedentes, decidirReserva, criarLimitador, limparTexto, diaBrasilia, configCupom, cupomElegivel, montarAvisoCupom, publicoDaLoja, configFidelidade, ganhouPresente, avisoPresente, restanteDoDia, chaveCadastro, avisoCadastro, emailCadastro, LIMITE_DIARIO_PADRAO, MAX_PEDIDOS_PUBLICO };
