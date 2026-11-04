@@ -358,4 +358,172 @@ function avisoChat({ destinoLado, pedidoKey, pedido = {}, loja = {}, texto = '',
 }
 const tagDoChat = (pedidoKey) => `chat-${pedidoKey}`;
 
-module.exports = { CHAT_INTERVALO_MS, CHAT_MSG_RECENTE_MS, esconderContato, previaChat, destinoChat, decidirAvisoChat, avisoChat, tagDoChat, ETAPA_DO_EVENTO, IMAGEM_DA_ETAPA, CHEGANDO_M, ehAvisoDeEtapa, tagDoPedido, textoTempo, quemLevaDe, chegandoValido, APPS_ICONE, ICONE_PADRAO, BADGE_DO_APP, appDoCaminho, hojeBrasilia, iconeDeCampanha, ALIAS_EVENTO, EVENTOS_PEDIDO, normalizarEvento, ehEventoDePedido, resolverDestino, chaveEvento, montarAviso, urlDoApp, tokenValido, plataformaValida, tokensExcedentes, decidirReserva, criarLimitador, limparTexto, diaBrasilia, configCupom, cupomElegivel, montarAvisoCupom, publicoDaLoja, configFidelidade, ganhouPresente, avisoPresente, restanteDoDia, chaveCadastro, avisoCadastro, emailCadastro, LIMITE_DIARIO_PADRAO, MAX_PEDIDOS_PUBLICO };
+// ---------- V7.6 — ofertas automáticas (agendador do Master) ----------
+// config_plataforma/push_auto = { ativo, horarios: { cafe|almoco|jantar: { ativo, hora: 'HH:MM', dias: '0123456', modo: 'oferta'|'fixa', titulo, corpo, lojaId } } }
+// O agendador (cron-job.org) chama POST /cron/ofertas a cada 15 min; cada horário sai no máximo 1 vez por dia, nos 30 min depois da hora.
+const HORARIOS_AUTO = ['cafe', 'almoco', 'jantar'];
+const HORARIO_PADRAO = { cafe: { hora: '08:00', emoji: '☕', nome: 'café' }, almoco: { hora: '11:00', emoji: '🍽️', nome: 'almoço' }, jantar: { hora: '18:30', emoji: '🌙', nome: 'jantar' } };
+const JANELA_AUTO_MIN = 30;
+const DIAS_SEMANA = ['domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado'];
+const minutosHHMM = (h) => { const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(h || '')); return m ? Number(m[1]) * 60 + Number(m[2]) : null; };
+const minutosLivres = (h) => { const m = /^(\d{1,2}):(\d{2})/.exec(String(h || '')); return m ? Number(m[1]) * 60 + Number(m[2]) : null; };
+
+/** Relógio de Brasília (sem horário de verão desde 2019): dia AAAA-MM-DD, dia da semana (0 = domingo) e minutos do dia. */
+function relogioBrasilia(agora = Date.now()) {
+  const d = new Date(agora - 3 * 3600000);
+  return { dia: d.toISOString().slice(0, 10), dow: d.getUTCDay(), min: d.getUTCHours() * 60 + d.getUTCMinutes() };
+}
+
+/** Configuração do Master normalizada. Sem configuração: tudo desligado. */
+function configAuto(raw) {
+  const r = raw && typeof raw === 'object' ? raw : {};
+  const horarios = {};
+  for (const id of HORARIOS_AUTO) {
+    const s = (r.horarios && typeof r.horarios === 'object' && r.horarios[id]) || {};
+    const dias = /^[0-6]{0,7}$/.test(String(s.dias ?? '0123456')) ? [...new Set(String(s.dias ?? '0123456').split('').map(Number))].sort() : [0, 1, 2, 3, 4, 5, 6];
+    horarios[id] = {
+      ativo: s.ativo === true,
+      hora: minutosHHMM(s.hora) !== null ? s.hora : HORARIO_PADRAO[id].hora,
+      dias,
+      modo: s.modo === 'fixa' ? 'fixa' : 'oferta',
+      titulo: limparTexto(s.titulo, 80),
+      corpo: limparTexto(s.corpo, 200),
+      lojaId: typeof s.lojaId === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(s.lojaId) ? s.lojaId : ''
+    };
+  }
+  return { ativo: r.ativo === true, horarios };
+}
+
+/** Quais horários devem sair agora: chave geral e o horário ligados, dia da semana marcado e de 0 a 29 min depois da hora. */
+function horariosDaVez(cfg, agora = Date.now(), janela = JANELA_AUTO_MIN) {
+  if (!cfg || !cfg.ativo) return [];
+  const { dow, min } = relogioBrasilia(agora);
+  return HORARIOS_AUTO.filter((id) => {
+    const s = cfg.horarios[id];
+    if (!s || !s.ativo || !s.dias.includes(dow)) return false;
+    if (s.modo === 'fixa' && (!s.titulo || !s.corpo)) return false;
+    const h = minutosHHMM(s.hora);
+    return h !== null && min >= h && min < h + janela;
+  });
+}
+
+/** A loja está aberta agora (horário de Brasília)? Mesma regra do app (js/regras.js lojaAberta + js/abertura-loja.js). */
+function lojaAbertaAgora(loja, agora = Date.now()) {
+  if (!loja || loja.activo === false) return false;
+  const ab = loja.abertura || {};
+  const abreAs = Number(ab.abreAs);
+  if ((ab.resposta === 'adiado' || ab.resposta === 'hoje-nao') && Number.isFinite(abreAs) && abreAs > agora) return false;
+  const horarios = loja.horarios;
+  if (!horarios || typeof horarios !== 'object') return true;
+  const { dow, min: t } = relogioBrasilia(agora);
+  const hoje = horarios[DIAS_SEMANA[dow]], ontem = horarios[DIAS_SEMANA[(dow + 6) % 7]];
+  if (ontem && ontem.aberto !== false) {
+    const a = minutosLivres(ontem.abre), f = minutosLivres(ontem.fecha);
+    if (a !== null && f !== null && f <= a && t < f) return true;
+  }
+  if (!hoje) return true;
+  if (hoje.aberto === false) return false;
+  const a = minutosLivres(hoje.abre), f = minutosLivres(hoje.fecha);
+  if (a === null || f === null) return true;
+  return f > a ? (t >= a && t < f) : (t >= a || t < f);
+}
+
+/** Loja de cidade que ainda não abriu (em espera) não é divulgada. Loja sem cidade, ou cidade não cadastrada: pode. */
+function cidadeLiberada(loja, cidades) {
+  const id = loja && loja.cidadeId;
+  if (!id) return true;
+  const c = cidades && cidades[id];
+  return !c || c.status === 'aberta';
+}
+
+/** A loja pode aparecer numa notificação agora? Ativa, não suspensa, cidade aberta e aberta neste horário. */
+const lojaDivulgavel = (lojaId, loja, { suspensas = {}, cidades = {}, agora = Date.now() } = {}) =>
+  !!loja && loja.activo !== false && !(suspensas && suspensas[lojaId] != null) && cidadeLiberada(loja, cidades) && lojaAbertaAgora(loja, agora);
+
+/** Cupons públicos válidos hoje (não secretos, não esgotados), o melhor primeiro; cupom de 1ª compra fica por último. */
+function cuponsDivulgaveis(loja, usoLoja = {}, agora = Date.now()) {
+  const lista = Object.entries((loja && loja.cupones) || {})
+    .filter(([, c]) => c && c.oculto !== true && cupomElegivel(c, agora))
+    .filter(([, c]) => { const max = Number.isInteger(c.maxUsos) && c.maxUsos > 0 ? c.maxUsos : 0; const u = usoLoja && usoLoja[c.codigo]; return !max || (Number(u && u.total) || 0) < max; });
+  const peso = (c) => (c.primeiraCompra === true ? -10000 : 0) + (c.tipo === 'porcentagem' ? 3000 + Number(c.valor) : c.tipo === 'fixo' ? 1000 + Number(c.valor) : 2000) - (Number(c.minimo) || 0) / 1000;
+  return lista.sort(([, a], [, b]) => peso(b) - peso(a)).map(([id, c]) => ({ cupomId: id, cupom: c }));
+}
+
+/** Oferta automática: entre as lojas divulgáveis com cupom, a que apareceu há mais tempo (revezamento). */
+function escolherOferta({ lojas = {}, suspensas = {}, cidades = {}, historico = {}, usoCupons = {}, agora = Date.now() } = {}) {
+  const cand = [];
+  for (const [lojaId, loja] of Object.entries(lojas || {})) {
+    if (!lojaDivulgavel(lojaId, loja, { suspensas, cidades, agora })) continue;
+    const cupons = cuponsDivulgaveis(loja, (usoCupons || {})[lojaId], agora);
+    if (!cupons.length) continue;
+    cand.push({ lojaId, loja, ...cupons[0], ultimo: Number(historico && historico[lojaId] && historico[lojaId].ultimoEm) || 0 });
+  }
+  cand.sort((a, b) => a.ultimo - b.ultimo || String(a.loja.nombre || '').localeCompare(String(b.loja.nombre || ''), 'pt-BR') || a.lojaId.localeCompare(b.lojaId));
+  return cand[0] || null;
+}
+
+/** Anúncio só sai no almoço e no jantar (o café fica para as ofertas automáticas). */
+const HORARIOS_ANUNCIO = ['almoco', 'jantar'];
+/** Notificações de cada plano de anúncio (Master: config_plataforma/anuncios_planos n7/n15/n30, de 0 a 10). */
+function pushDosPlanos(cfg) {
+  const out = {};
+  for (const d of [7, 15, 30]) { const n = Math.floor(Number(cfg && cfg[`n${d}`])); out[d] = n >= 0 && n <= 10 ? n : 0; }
+  return out;
+}
+
+/** Anúncio que tem notificação para gastar: no ar, dentro do prazo, loja divulgável; o que acaba primeiro vai antes. */
+function escolherAnuncio({ anuncios = {}, pushUso = {}, planos = {}, lojas = {}, suspensas = {}, cidades = {}, agora = Date.now() } = {}) {
+  const porPlano = pushDosPlanos(planos);
+  const cand = [];
+  for (const [id, a] of Object.entries(anuncios || {})) {
+    if (!a || a.status !== 'no_ar' || !(Number(a.fimEm) > agora) || typeof a.lojaId !== 'string') continue;
+    const uso = (pushUso || {})[id] || {};
+    const total = Number.isInteger(uso.total) ? uso.total : (porPlano[Number(a.dias)] || 0);
+    const usados = Number(uso.usados) || 0;
+    if (usados >= total) continue;
+    const loja = lojas[a.lojaId];
+    if (!lojaDivulgavel(a.lojaId, loja, { suspensas, cidades, agora })) continue;
+    cand.push({ anuncioId: id, anuncio: a, lojaId: a.lojaId, loja, total, usados });
+  }
+  cand.sort((x, y) => Number(x.anuncio.fimEm) - Number(y.anuncio.fimEm) || x.anuncioId.localeCompare(y.anuncioId));
+  return cand[0] || null;
+}
+
+const reaisCurto = (v) => { const n = Number(v || 0); return Number.isInteger(n) ? `R$ ${n}` : reais(n); };
+/** Texto do valor do cupom: "10% OFF (até R$ 15,00)", "R$ 5,00 OFF" ou "Entrega grátis". */
+function valorDoCupom(c = {}) {
+  if (c.tipo === 'porcentagem') return `${Number(c.valor)}% OFF${Number(c.teto) > 0 ? ` (até ${reaisCurto(c.teto)})` : ''}`;
+  if (c.tipo === 'fixo') return `${reaisCurto(c.valor)} OFF`;
+  return 'Entrega grátis';
+}
+
+/** Aviso da oferta: "🍽️ Oferta da Uai Crep's" / "10% OFF em pedidos acima de R$ 30. Toque para pedir no almoço." Abre a loja com o cupom. */
+function avisoOferta({ lojaId, loja = {}, cupom = null, horario = 'almoco', frase = '' }) {
+  const h = HORARIO_PADRAO[horario] || HORARIO_PADRAO.almoco;
+  const nome = limparTexto(loja.nombre || loja.nome || 'sua loja favorita', 40);
+  let corpo;
+  if (limparTexto(frase, 160)) corpo = limparTexto(frase, 160);
+  else if (cupom) {
+    const min = Number(cupom.minimo) > 0 ? ` em pedidos acima de ${reaisCurto(cupom.minimo)}` : '';
+    const primeira = cupom.primeiraCompra === true ? ' na sua 1ª compra na loja' : '';
+    const sel = cupom.produtos && Object.values(cupom.produtos).some((v) => v === true) ? ' em produtos selecionados' : '';
+    corpo = `${valorDoCupom(cupom)}${sel}${min}${primeira}. Toque para pedir no ${h.nome}.`;
+  } else corpo = `Toque para ver o cardápio e pedir no ${h.nome}.`;
+  const cod = cupom && /^[A-Z0-9_-]{3,20}$/.test(String(cupom.codigo || '')) ? `&cupom=${encodeURIComponent(cupom.codigo)}` : '';
+  return { titulo: limparTexto(`${h.emoji} Oferta da ${nome}`, 100), corpo: limparTexto(corpo, 200), caminho: `restaurante.html?id=${encodeURIComponent(lojaId)}${cod}` };
+}
+
+/** Quem recebe ofertas: aparelhos de todos, menos quem desligou "Ofertas e cupons" (prefs_ofertas/{uid} = false) e as contas bloqueadas. */
+function publicoOfertas(fcmTokens = {}, optOut = {}, bloqueados = {}) {
+  const vistos = new Set(), lista = [];
+  for (const [uid, entries] of Object.entries(fcmTokens || {})) {
+    if ((optOut && optOut[uid] === false) || (bloqueados && bloqueados[uid] != null)) continue;
+    for (const [tokenId, item] of Object.entries(entries || {})) {
+      if (item && item.token && !vistos.has(item.token)) { vistos.add(item.token); lista.push({ uid, tokenId, token: item.token }); }
+    }
+  }
+  return lista;
+}
+const aceitaOfertas = (optOut, uid) => !(optOut && optOut[uid] === false);
+
+module.exports = { HORARIOS_AUTO, HORARIOS_ANUNCIO, reaisCurto, HORARIO_PADRAO, JANELA_AUTO_MIN, relogioBrasilia, configAuto, horariosDaVez, lojaAbertaAgora, cidadeLiberada, lojaDivulgavel, cuponsDivulgaveis, escolherOferta, pushDosPlanos, escolherAnuncio, valorDoCupom, avisoOferta, publicoOfertas, aceitaOfertas, CHAT_INTERVALO_MS, CHAT_MSG_RECENTE_MS, esconderContato, previaChat, destinoChat, decidirAvisoChat, avisoChat, tagDoChat, ETAPA_DO_EVENTO, IMAGEM_DA_ETAPA, CHEGANDO_M, ehAvisoDeEtapa, tagDoPedido, textoTempo, quemLevaDe, chegandoValido, APPS_ICONE, ICONE_PADRAO, BADGE_DO_APP, appDoCaminho, hojeBrasilia, iconeDeCampanha, ALIAS_EVENTO, EVENTOS_PEDIDO, normalizarEvento, ehEventoDePedido, resolverDestino, chaveEvento, montarAviso, urlDoApp, tokenValido, plataformaValida, tokensExcedentes, decidirReserva, criarLimitador, limparTexto, diaBrasilia, configCupom, cupomElegivel, montarAvisoCupom, publicoDaLoja, configFidelidade, ganhouPresente, avisoPresente, restanteDoDia, chaveCadastro, avisoCadastro, emailCadastro, LIMITE_DIARIO_PADRAO, MAX_PEDIDOS_PUBLICO };

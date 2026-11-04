@@ -5,6 +5,8 @@ Rotas (todas com Firebase ID Token, exceto `/` e `/health`):
 - `POST /remover-token` {token}
 - `POST /notificar-pedido` {pedidoKey, evento} — ou {evento:'bairro', lojaId, bairroId}.
 - `POST /notificar-master` {titulo, corpo, link?, campanhaId?} — só Master.
+- `POST /notificar-master` e `/notificar-cupom` não enviam para quem desligou "Ofertas e cupons" no perfil (V7.6).
+- `POST /cron/ofertas` — **sem login**, só com o cabeçalho `X-Push-Cron-Chave` (= `PUSH_CRON_CHAVE`). Chamada pelo cron-job.org a cada 15 min; envia as ofertas automáticas do café, do almoço e do jantar (V7.6).
 - `GET /health`
 
 ## Eventos

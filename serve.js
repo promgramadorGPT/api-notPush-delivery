@@ -6,7 +6,7 @@ const admin = require("firebase-admin");
 const crypto = require("crypto");
 const N = require("./notificacoes");
 
-const VERSAO = "7.5.0";
+const VERSAO = "7.6.0";
 const MAX_TOKENS_POR_USUARIO = 10;
 const app = express();
 
@@ -362,13 +362,9 @@ app.post("/notificar-master", autenticar, async (req, res) => {
 
     if ((await lerValor(`admins/${req.user.uid}/role`)) !== "master") return res.status(403).json({ ok: false, error: "Usuário não é Master." });
 
-    const usersTokens = (await lerValor("fcm_tokens")) || {};
-    const vistos = new Set(), tokens = [];
-    for (const [uid, entries] of Object.entries(usersTokens)) {
-      for (const [tokenId, item] of Object.entries(entries || {})) {
-        if (item?.token && !vistos.has(item.token)) { vistos.add(item.token); tokens.push({ uid, tokenId, token: item.token }); }
-      }
-    }
+    // V7.6: quem desligou "Ofertas e cupons" no perfil (prefs_ofertas/{uid} = false) não recebe campanha
+    const [usersTokens, optOut] = await Promise.all([lerValor("fcm_tokens"), lerValor("prefs_ofertas")]);
+    const tokens = N.publicoOfertas(usersTokens || {}, optOut || {});
     log("Master: aparelhos:", tokens.length);
 
     const baseLink = link ? (link.startsWith("/") ? N.urlDoApp(process.env.APP_URL || "", link) : link) : N.urlDoApp(process.env.APP_URL || "", "index.html");
@@ -534,7 +530,8 @@ app.post("/notificar-cupom", autenticar, async (req, res) => {
     // Público: quem já pediu nesta loja (pedidos recentes), sem contas bloqueadas
     const snap = await db().ref("pedidos").orderByChild("lojaId").equalTo(lojaId).limitToLast(N.MAX_PEDIDOS_PUBLICO).once("value");
     const bloqueados = (await lerValor("usuarios_bloqueados")) || {};
-    const clientes = N.publicoDaLoja(snap.val(), bloqueados);
+    const optOut = (await lerValor("prefs_ofertas")) || {}; // V7.6: quem desligou "Ofertas e cupons" fica de fora
+    const clientes = N.publicoDaLoja(snap.val(), bloqueados).filter((cli) => N.aceitaOfertas(optOut, cli));
 
     const tokensTodos = [];
     const vistos = new Set();
@@ -620,6 +617,146 @@ app.post("/notificar-cupom", autenticar, async (req, res) => {
     if (!jaEnviou) await liberar();
     return erroInterno(res, "/notificar-cupom", err);
   }
+});
+
+// ---------------- V7.6: ofertas automáticas (café, almoço e jantar) ----------------
+// O cron-job.org chama POST /cron/ofertas a cada 15 min com o cabeçalho X-Push-Cron-Chave (= PUSH_CRON_CHAVE no Render).
+// O Master liga/desliga em config_plataforma/push_auto. Cada horário sai no máximo 1 vez por dia; a escolha é feita aqui:
+// 1) anúncio no ar que ainda tem notificação do plano (no máximo 1 anúncio por dia); 2) senão, cupom público de uma loja aberta (revezando).
+const chaveCron = () => String(process.env.PUSH_CRON_CHAVE || "").trim();
+function chaveCronOk(recebida) {
+  const certa = chaveCron();
+  if (certa.length < 16 || typeof recebida !== "string") return false;
+  const a = crypto.createHash("sha256").update(recebida).digest(), b = crypto.createHash("sha256").update(certa).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+const ehTokenMorto = (code) => code.includes("registration-token-not-registered") || code.includes("invalid-registration-token");
+
+/** Envia o mesmo aviso para muitos aparelhos (lotes de 500) e tira da lista os aparelhos que não existem mais. */
+async function enviarEmMassa(tokens, aviso, dados) {
+  await carregarIcones();
+  let enviados = 0;
+  const falhas = [], invalidos = [];
+  for (let inicio = 0; inicio < tokens.length; inicio += 500) {
+    const lote = tokens.slice(inicio, inicio + 500);
+    try {
+      const response = await comTimeout(admin.messaging().sendEach(lote.map((it) => montarMensagem(it.token, aviso, dados))), 30000, "Envio FCM em massa");
+      response.responses.forEach((r, i) => {
+        if (r.success) { enviados++; return; }
+        const code = r.error?.code || "unknown";
+        falhas.push(code);
+        if (ehTokenMorto(code)) invalidos.push(lote[i]);
+      });
+    } catch (err) {
+      console.error("[NotPush] lote em massa erro:", err.message);
+      for (let i = 0; i < lote.length; i++) falhas.push("batch-error");
+    }
+  }
+  for (const it of invalidos) {
+    await db().ref(`fcm_tokens/${it.uid}/${it.tokenId}`).remove().catch(() => {});
+    await db().ref(`fcm_token_owner/${it.tokenId}`).remove().catch(() => {});
+  }
+  const codigos = {};
+  for (const c of falhas) { const k = c.replace(/[.#$\[\]\/]/g, "_"); codigos[k] = (codigos[k] || 0) + 1; }
+  return { tokens: tokens.length, enviados, falhas: falhas.length, removidos: invalidos.length, ...(falhas.length ? { codigos } : {}) };
+}
+
+/** Reserva o horário do dia. Pode tentar de novo (na mesma janela) só se a tentativa anterior não achou oferta. */
+async function reservarHorario(caminho, agora) {
+  let novo = null;
+  const t = await db().ref(caminho).transaction((atual) => {
+    novo = null;
+    if (!atual) novo = { reservadoEm: agora };
+    else if (atual.enviado === false && agora - Number(atual.em || 0) >= 10 * 60000) novo = { reservadoEm: agora, tentativas: (Number(atual.tentativas) || 1) + 1 };
+    return novo || undefined;
+  });
+  return t.committed && novo ? novo : null;
+}
+
+/** Gasta 1 notificação do anúncio (transação; o total do plano fica congelado na 1ª vez). */
+async function gastarNotificacaoDoAnuncio(escolha, chaveEnvio, agora) {
+  let ok = false;
+  const t = await db().ref(`anuncios_push/${escolha.anuncioId}`).transaction((atual) => {
+    const total = Number.isInteger(atual?.total) ? atual.total : escolha.total;
+    const usados = Number(atual?.usados) || 0;
+    if (usados >= total) { ok = false; return undefined; }
+    ok = true;
+    return { ...(atual || {}), lojaId: escolha.lojaId, total, usados: usados + 1, envios: { ...(atual?.envios || {}), [chaveEnvio]: { em: agora, aparelhos: 0 } } };
+  });
+  return t.committed && ok;
+}
+
+async function processarHorario(horario, cfg, base, agora) {
+  const { dia } = N.relogioBrasilia(agora);
+  const caminho = `notificaciones_auto/${dia}/${horario}`;
+  const reserva = await reservarHorario(caminho, agora);
+  if (!reserva) return { horario, pulado: true, motivo: "ja-enviado" };
+  const s = cfg.horarios[horario];
+  const registro = (extra) => db().ref(caminho).set({ criadoEm: new Date(agora).toISOString(), em: agora, horario, ...(reserva.tentativas ? { tentativas: reserva.tentativas } : {}), ...extra });
+  try {
+    let aviso, tipo, lojaId = "", anuncioId = "", escolhaAd = null;
+    if (s.modo === "fixa") {
+      tipo = "fixa";
+      lojaId = s.lojaId && base.lojas[s.lojaId] ? s.lojaId : "";
+      aviso = { titulo: s.titulo, corpo: s.corpo, caminho: lojaId ? `restaurante.html?id=${encodeURIComponent(lojaId)}` : "index.html" };
+    } else {
+      const adDia = `notificaciones_auto_ad/${dia}`;
+      escolhaAd = !N.HORARIOS_ANUNCIO.includes(horario) || (await lerValor(adDia)) ? null : N.escolherAnuncio({ ...base, agora });
+      if (escolhaAd && !(await reservarUnico(adDia))) escolhaAd = null;
+      if (escolhaAd && !(await gastarNotificacaoDoAnuncio(escolhaAd, `${dia}_${horario}`, agora))) { await db().ref(adDia).remove().catch(() => {}); escolhaAd = null; }
+      if (escolhaAd) {
+        tipo = "anuncio"; lojaId = escolhaAd.lojaId; anuncioId = escolhaAd.anuncioId;
+        const cup = N.cuponsDivulgaveis(escolhaAd.loja, base.usoCupons[lojaId], agora)[0];
+        aviso = N.avisoOferta({ lojaId, loja: escolhaAd.loja, cupom: cup ? cup.cupom : null, horario, frase: escolhaAd.anuncio.frase });
+      } else {
+        const of = N.escolherOferta({ ...base, agora });
+        if (!of) { await registro({ enviado: false, motivo: "sem-oferta" }); return { horario, enviado: false, motivo: "sem-oferta" }; }
+        tipo = "oferta"; lojaId = of.lojaId;
+        aviso = N.avisoOferta({ lojaId, loja: of.loja, cupom: of.cupom, horario });
+      }
+    }
+    if (!base.publico.length) {
+      if (escolhaAd) await db().ref(`notificaciones_auto_ad/${dia}`).remove().catch(() => {}); // ninguém recebeu: o anúncio não gasta o dia (a notificação gasta fica registrada)
+      await registro({ enviado: false, motivo: "sem-aparelhos", tipo, lojaId, anuncioId, titulo: aviso.titulo, corpo: aviso.corpo });
+      return { horario, enviado: false, motivo: "sem-aparelhos" };
+    }
+    const resultado = await enviarEmMassa(base.publico, aviso, { tipo: "oferta", evento: `auto_${horario}`, lojaId, tag: `oferta:${dia}:${horario}` });
+    await registro({ enviado: true, tipo, lojaId, anuncioId, titulo: aviso.titulo, corpo: aviso.corpo, caminho: aviso.caminho, resultado });
+    if (lojaId) await db().ref(`push_auto_lojas/${lojaId}`).set({ ultimoEm: agora, horario, tipo }).catch(() => {});
+    if (anuncioId) await db().ref(`anuncios_push/${anuncioId}/envios/${dia}_${horario}`).set({ em: agora, horario, aparelhos: resultado.enviados }).catch(() => {});
+    log("OFERTA AUTO:", dia, horario, tipo, lojaId, JSON.stringify(resultado));
+    return { horario, enviado: true, tipo, lojaId, ...resultado };
+  } catch (err) {
+    console.error("[NotPush] oferta automática", horario, err.message);
+    await registro({ enviado: false, motivo: "erro" }).catch(() => {});
+    return { horario, enviado: false, motivo: "erro" };
+  }
+}
+
+app.post("/cron/ofertas", async (req, res) => {
+  try {
+    if (!chaveCronOk(req.headers["x-push-cron-chave"])) return res.status(401).json({ ok: false, error: "Não autorizado." });
+    if (!limiteInterno("cron-ofertas")) return res.status(429).json({ ok: false, error: "Muitas chamadas. Aguarde um minuto." });
+    const agora = Date.now();
+    const cfg = N.configAuto(await lerValor("config_plataforma/push_auto"));
+    const [fcm, optOut, bloqueados] = await Promise.all([lerValor("fcm_tokens"), lerValor("prefs_ofertas"), lerValor("usuarios_bloqueados")]);
+    const publico = N.publicoOfertas(fcm || {}, optOut || {}, bloqueados || {});
+    const clientes = new Set(publico.map((t) => t.uid)).size;
+    await db().ref("push_publico").set({ aparelhos: publico.length, clientes, em: agora }).catch(() => {});
+    const devidos = N.horariosDaVez(cfg, agora);
+    const resultados = [];
+    if (devidos.length) {
+      const [lojas, suspensas, cidades, historico, usoCupons, anuncios, pushUso, planos] = await Promise.all([
+        lerValor("restaurantes"), lerValor("lojas_suspensas"), lerValor("cidades"), lerValor("push_auto_lojas"),
+        lerValor("cupons_uso"), lerValor("anuncios"), lerValor("anuncios_push"), lerValor("config_plataforma/anuncios_planos")
+      ]);
+      const base = { lojas: lojas || {}, suspensas: suspensas || {}, cidades: cidades || {}, historico: historico || {}, usoCupons: usoCupons || {}, anuncios: anuncios || {}, pushUso: pushUso || {}, planos: planos || {}, publico };
+      for (const h of devidos) resultados.push(await processarHorario(h, cfg, base, agora));
+    }
+    const ultimo = resultados.find((r) => !r.pulado);
+    await db().ref("push_auto_status").update({ ultimaChamada: agora, versao: VERSAO, ativo: cfg.ativo, ...(ultimo ? { ultimoResultado: { em: agora, horario: ultimo.horario, enviado: !!ultimo.enviado, motivo: ultimo.motivo || null, tipo: ultimo.tipo || null, enviados: ultimo.enviados || 0 } } : {}) }).catch(() => {});
+    return res.json({ ok: true, ativo: cfg.ativo, publico: { aparelhos: publico.length, clientes }, horarios: resultados });
+  } catch (err) { return erroInterno(res, "/cron/ofertas", err); }
 });
 
 const PORT = process.env.PORT || 10000;
