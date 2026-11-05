@@ -1,12 +1,13 @@
-// NotPush Delivery V7 — BR. Rotas e autenticação (Firebase ID Token) mantidas da V6; regras puras em notificacoes.js.
+// NotPush Delivery V7 — BR. V7.7: o servidor conta as vendas do cardápio (pedidos entregues), no lugar do painel da loja. Rotas e autenticação (Firebase ID Token) mantidas da V6; regras puras em notificacoes.js.
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
 const admin = require("firebase-admin");
 const crypto = require("crypto");
 const N = require("./notificacoes");
+const V = require("./vendas"); // V7.7: contador de vendas do cardápio
 
-const VERSAO = "7.6.0";
+const VERSAO = "7.7.0";
 const MAX_TOKENS_POR_USUARIO = 10;
 const app = express();
 
@@ -733,6 +734,35 @@ async function processarHorario(horario, cfg, base, agora) {
   }
 }
 
+// ---------------- V7.7: contador de vendas do cardápio (selo "Mais pedida", "mais pedidos" da loja) ----------------
+const ioVendas = {
+  ler: lerValor,
+  lerDesde: async (iso) => (await db().ref("pedidos").orderByChild("criadoEm").startAt(iso).once("value")).val() || {},
+  atualizar: (up) => db().ref().update(up),
+  travar: async (agora) => {
+    const t = await db().ref("vendas_contagem/trava").transaction((atual) => (atual && agora - Number(atual) < V.TRAVA_MS ? undefined : agora));
+    return !!t.committed;
+  },
+  destravar: () => db().ref("vendas_contagem/trava").remove()
+};
+async function rodarVendas(agora) {
+  try {
+    const r = await comTimeout(V.contarVendas(ioVendas, agora), 45000, "Contagem de vendas");
+    if (r.itens) log("VENDAS:", r.modo, r.itens, "itens atualizados");
+    return r;
+  } catch (err) {
+    console.error("[NotPush] contagem de vendas:", err.message);
+    return { ok: false, erro: "falhou" };
+  }
+}
+app.post("/cron/vendas", async (req, res) => {
+  try {
+    if (!chaveCronOk(req.headers["x-push-cron-chave"])) return res.status(401).json({ ok: false, error: "Não autorizado." });
+    if (!limiteInterno("cron-vendas")) return res.status(429).json({ ok: false, error: "Muitas chamadas. Aguarde um minuto." });
+    return res.json({ ...(await rodarVendas(Date.now())) });
+  } catch (err) { return erroInterno(res, "/cron/vendas", err); }
+});
+
 app.post("/cron/ofertas", async (req, res) => {
   try {
     if (!chaveCronOk(req.headers["x-push-cron-chave"])) return res.status(401).json({ ok: false, error: "Não autorizado." });
@@ -755,7 +785,8 @@ app.post("/cron/ofertas", async (req, res) => {
     }
     const ultimo = resultados.find((r) => !r.pulado);
     await db().ref("push_auto_status").update({ ultimaChamada: agora, versao: VERSAO, ativo: cfg.ativo, ...(ultimo ? { ultimoResultado: { em: agora, horario: ultimo.horario, enviado: !!ultimo.enviado, motivo: ultimo.motivo || null, tipo: ultimo.tipo || null, enviados: ultimo.enviados || 0 } } : {}) }).catch(() => {});
-    return res.json({ ok: true, ativo: cfg.ativo, publico: { aparelhos: publico.length, clientes }, horarios: resultados });
+    const vendas = await rodarVendas(agora); // V7.7: aproveita a chamada do agendador (a cada 10 min); erro aqui não atrapalha as ofertas
+    return res.json({ ok: true, ativo: cfg.ativo, publico: { aparelhos: publico.length, clientes }, horarios: resultados, vendas });
   } catch (err) { return erroInterno(res, "/cron/ofertas", err); }
 });
 
